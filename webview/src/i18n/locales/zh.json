@@ -55,6 +55,41 @@
     "inputPlaceholder": "@引用文件，#唤起智能体，!插入提示词，Enter 发送",
     "inputPlaceholderEnter": "@引用文件，#唤起智能体，!插入提示词，Enter 发送",
     "inputPlaceholderCmdEnter": "@引用文件，#唤起智能体，!插入提示词，⌘Enter 发送",
+    "codexCommandBusy": "请等待当前 Codex 操作完成后再运行此命令。",
+    "codexQueue": {
+      "paused": "由于你中断了当前响应，队列已暂停",
+      "resume": "继续",
+      "edit": "编辑消息",
+      "editMessage": "编辑排队消息",
+      "save": "保存",
+      "cancel": "取消",
+      "attachment": "附件",
+      "steer": "引导",
+      "retry": "重试",
+      "remove": "删除排队的消息",
+      "reorder": "调整排队消息顺序",
+      "followUpMode": "Codex 后续消息行为",
+      "followUps": "后续消息：",
+      "overrideShortcut": "按 Cmd/Ctrl+Shift+Enter 可仅反转当前一条消息的行为",
+      "modeQueue": "排队",
+      "modeSteer": "引导",
+      "useSteer": "关闭排队",
+      "useQueue": "启用队列模式",
+      "moreOptions": "排队消息操作",
+      "preview": "预览排队消息",
+      "previewTitle": "排队消息预览",
+      "closePreview": "关闭排队消息预览",
+      "unsupportedAttachment": "Codex 队列和引导目前仅支持图片附件，请移除其他附件后重试。"
+    },
+    "codexFork": {
+      "label": "从此消息分叉聊天",
+      "busy": "请等待当前 Codex 回合结束后再分叉。",
+      "failed": "无法分叉此 Codex 聊天：{{error}}",
+      "timeout": "分叉请求超时。",
+      "unavailable": "Codex 原生桥接不可用。",
+      "noThreadId": "分叉响应未包含 thread ID。",
+      "createdInHistory": "分支已创建，可从历史记录打开。"
+    },
     "noThinkingContent": "无思考内容",
     "parseError": "无法解析内容",
     "sendMessageEnter": "发送消息 (Enter)",
@@ -67,6 +102,27 @@
     "addAttachment": "添加附件",
     "stopGeneration": "停止生成",
     "generatingResponse": "正在生成响应",
+    "codexTurnStatus": {
+      "thinking": "正在思考",
+      "tool": "正在执行工具",
+      "approval": "等待审批",
+      "planning": "正在制定计划",
+      "running": "正在运行"
+    },
+    "codexSubagents": {
+      "title": "子代理",
+      "active": "进行中",
+      "done": "已完成",
+      "waiting": "等待中",
+      "waitingCount": "{{count}} 个等待中",
+      "status": {
+        "running": "正在运行",
+        "waiting": "等待中",
+        "completed": "已完成",
+        "error": "失败"
+      },
+      "toggleDetails": "展开或收起 {{name}} 的详情"
+    },
     "elapsedTime": "已用 {{time}}",
     "minutesAndSeconds": "{{minutes}} 分 {{seconds}} 秒",
     "imagePreview": "预览",
@@ -1918,6 +1974,19 @@
     "stopped": "已停止"
   },
   "subagent": {
+    "transcript": {
+      "title": "子代理对话",
+      "back": "返回子代理列表",
+      "loading": "正在加载子代理对话…",
+      "empty": "没有可显示的对话消息。",
+      "failed": "无法加载子代理对话。{{error}}",
+      "retry": "重试",
+      "assistant": "Codex",
+      "user": "你",
+      "tool": "工具输出",
+      "summary": "摘要",
+      "emptyToolOutput": "没有文本输出"
+    },
     "process": {
       "title": "Agent 进程",
       "prompt": "提示词",

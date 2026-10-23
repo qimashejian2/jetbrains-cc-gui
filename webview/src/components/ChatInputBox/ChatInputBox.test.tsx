@@ -254,6 +254,21 @@ describe('ChatInputBox event wiring', () => {
     expect(editable.textContent).toBe('');
   });
 
+  it('keeps a native queue draft when the add request fails', async () => {
+    const onSubmit = vi.fn().mockResolvedValue(false);
+    render(<ControlledInput preserveInputUntilSubmitAccepted onSubmit={onSubmit} />);
+    const editable = screen.getByRole('textbox');
+    typeText(editable, 'keep this if native enqueue fails');
+
+    fireEvent.keyDown(editable, { key: 'Enter', code: 'Enter' });
+    fireEvent.keyUp(editable, { key: 'Enter', code: 'Enter' });
+    await act(() => vi.advanceTimersByTimeAsync(20));
+    await act(async () => vi.advanceTimersByTimeAsync(0));
+
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith('keep this if native enqueue fails', undefined);
+    expect(editable.textContent).toBe('keep this if native enqueue fails');
+  });
+
   it('uses the latest submit callback for IDE shortcuts and waits for IME confirmation', async () => {
     const previousSubmit = vi.fn();
     const nextSubmit = vi.fn();

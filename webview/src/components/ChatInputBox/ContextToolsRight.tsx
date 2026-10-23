@@ -32,8 +32,7 @@ export const ContextToolsRight: React.FC<ContextToolsRightProps> = memo(({
         />
       )}
 
-      {/* StatusPanel expand/collapse toggle - always visible */}
-      {onToggleStatusPanel && (
+      {currentProvider !== 'codex' && onToggleStatusPanel && (
         <button
           className={`context-tool-btn status-panel-toggle has-tooltip ${statusPanelExpanded ? 'expanded' : 'collapsed'}`}
           onClick={onToggleStatusPanel}

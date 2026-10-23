@@ -33,6 +33,12 @@ interface UseSubagentsParams {
  * Sync agents (task/agent without run_in_background) run inline: a tool_result
  * means the agent is done.
  */
+function timestampMillis(value?: string): number | undefined {
+  if (!value) return undefined;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : undefined;
+}
+
 function determineStatus(
   result: ToolResultBlock | null,
   isAsync: boolean,
@@ -102,7 +108,8 @@ export function extractSubagentsFromMessages(
   taskEvents: TaskEventMap = {},
 ): SubagentInfo[] {
   const subagents: SubagentInfo[] = [];
-  const nativeStates = new Map<string, { status?: string; resultText?: string; agentPath?: string; messageIndex?: number; nativeTaskId?: string }>();
+  const nativeStates = new Map<string, { status?: string; resultText?: string; agentPath?: string;
+    messageIndex?: number; nativeTaskId?: string; startedAt?: number }>();
   const followups = new Set(messages.flatMap(message => getContentBlocks(message)
     .filter(block => block.type === 'tool_use' && normalizeToolName(block.name ?? '') === 'followup_task')
     .map(block => block.type === 'tool_use' ? block.id : undefined)));
@@ -126,6 +133,7 @@ export function extractSubagentsFromMessages(
             if (state && typeof state === 'object' && typeof state.status === 'string') nativeStates.set(agentId, {
               ...nativeStates.get(agentId), status: state.status,
               resultText: typeof state.message === 'string' ? state.message : undefined,
+            startedAt: nativeStates.get(agentId)?.startedAt ?? timestampMillis(message.timestamp),
             });
           }
         }
@@ -144,6 +152,7 @@ export function extractSubagentsFromMessages(
             ...(restartsTask ? { nativeTaskId: callId as string, resultText: undefined } : {}),
             ...(typeof agentPath === 'string' ? { agentPath } : {}),
             messageIndex: previous?.messageIndex ?? messageIndex,
+            startedAt: previous?.startedAt ?? timestampMillis(message.timestamp),
           });
         }
       }
@@ -198,6 +207,7 @@ export function extractSubagentsFromMessages(
         ...resultMetadata,
         ...(agentId && { agentId }),
         ...(spawnMeta.agentPath && { agentPath: spawnMeta.agentPath }),
+        ...(timestampMillis(message.timestamp) !== undefined ? { startedAt: timestampMillis(message.timestamp) } : {}),
       }));
     });
   });
@@ -220,17 +230,23 @@ export function extractSubagentsFromMessages(
     if (state.agentPath && !linked.some(agent => agent.agentId === agentId)) linked.push({
       id: agentId, agentId, agentPath: state.agentPath, type: state.agentPath.split('/').filter(Boolean).at(-1) ?? '',
       description: '', status: 'running', isAsync: true, messageIndex: state.messageIndex ?? 0,
+      ...(state.startedAt !== undefined ? { startedAt: state.startedAt } : {}),
     });
   }
   return linked.map(subagent => {
     const state = subagent.agentId ? nativeStates.get(subagent.agentId) : undefined;
     const status = state?.status === 'completed' ? 'completed'
       : ['errored', 'interrupted', 'shutdown'].includes(state?.status ?? '') ? 'error'
-      : ['running', 'pendingInit'].includes(state?.status ?? '') ? 'running' : subagent.status;
-    return { ...subagent, status,
+      : state?.status === 'pendingInit' ? 'waiting'
+      : state?.status === 'running' ? 'running' : subagent.status;
+    return {
+      ...subagent,
+      status,
+      ...(state ? { nativeStatusAuthoritative: true } : {}),
       ...(state?.agentPath ? { agentPath: state.agentPath, type: subagent.type || state.agentPath.split('/').filter(Boolean).at(-1) || '' } : {}),
       ...(state?.resultText ? { resultText: state.resultText } : {}),
       ...(state?.nativeTaskId ? { nativeTaskId: state.nativeTaskId } : {}),
+      ...(state?.startedAt !== undefined ? { startedAt: state.startedAt } : {}),
     };
   });
 }
@@ -240,7 +256,7 @@ export function applySubagentHistoryCompletion(
   subagentHistories: Record<string, SubagentHistoryResponse>,
 ): SubagentInfo[] {
   return subagents.map((subagent) => {
-    if (!subagent.isAsync || subagent.status !== 'running') return subagent;
+    if (!subagent.isAsync || (subagent.status !== 'running' && subagent.status !== 'waiting')) return subagent;
     const history = subagentHistories[subagent.id]
       ?? (subagent.agentId ? subagentHistories[subagent.agentId] : undefined);
     const currentHistory = isSubagentHistoryCurrent(history, subagent.nativeTaskId);
@@ -250,6 +266,9 @@ export function applySubagentHistoryCompletion(
     // A running child may consume followup in its current turn; only exclude a proven ended one.
     const currentSubagent = subagent.nativeTaskId
       ? { ...subagent, nativeTaskPreviousTurnId: priorTerminalTurnId ?? undefined } : subagent;
+    if (currentSubagent.nativeStatusAuthoritative
+      && (currentSubagent.status === 'running' || currentSubagent.status === 'waiting')
+      && (!currentSubagent.nativeTaskId || !currentHistory)) return currentSubagent;
     if (!currentHistory) return currentSubagent;
     // Only an authoritatively-observed failure (the backend read the sidechain
     // and saw the turn abort) may flip the agent to error. Resolution/read

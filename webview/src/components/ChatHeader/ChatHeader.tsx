@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { TFunction } from 'i18next';
+import { ArrowLeft, Check, History, PanelLeft, Pencil, Plus, Search, Settings2, X } from 'lucide-react';
 
 import { BackIcon } from '../Icons';
 
 export interface ChatHeaderProps {
+  currentProvider?: string;
   currentView: 'chat' | 'history' | 'settings';
   sessionTitle: string;
   t: TFunction;
@@ -12,6 +14,7 @@ export interface ChatHeaderProps {
   onNewTab: () => void;
   onHistory: () => void;
   onSettings: () => void;
+  onOpenSubagents?: () => void;
   /**
    * Opens the in-conversation search panel. Only rendered when provided.
    * Wired up by App.tsx via UIStateContext.setSearchOpen.
@@ -22,6 +25,7 @@ export interface ChatHeaderProps {
 }
 
 export function ChatHeader({
+  currentProvider = 'claude',
   currentView,
   sessionTitle,
   t,
@@ -30,6 +34,7 @@ export function ChatHeader({
   onNewTab,
   onHistory,
   onSettings,
+  onOpenSubagents,
   onOpenSearch,
   onTitleChange,
   titleEditable = false,
@@ -37,6 +42,7 @@ export function ChatHeader({
   const [editing, setEditing] = useState(false);
   const [editValue, setEditValue] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
+  const isCodex = currentProvider === 'codex';
 
   // Render-time adjustment: stop editing when the title becomes non-editable
   // (same reset the old prop-change effect performed, without an extra commit).
@@ -93,11 +99,11 @@ export function ChatHeader({
   }
 
   return (
-    <div className="header">
+    <div className={`header${isCodex ? ' codex-header' : ''}`}>
       <div className="header-left">
         {currentView === 'history' ? (
           <button className="back-button" onClick={onBack} data-tooltip={t('common.back')}>
-            <BackIcon /> {t('common.back')}
+            {isCodex ? <ArrowLeft aria-hidden="true" /> : <BackIcon />} {t('common.back')}
           </button>
         ) : editing ? (
           <div className="session-title-edit-mode" onClick={(e) => e.stopPropagation()}>
@@ -114,10 +120,10 @@ export function ChatHeader({
               aria-label="Session title"
             />
             <button className="session-title-save-btn" onClick={commitEdit} aria-label="Save title">
-              <span className="codicon codicon-check" />
+              {isCodex ? <Check aria-hidden="true" /> : <span className="codicon codicon-check" />}
             </button>
             <button className="session-title-cancel-btn" onClick={cancelEdit} aria-label="Cancel editing">
-              <span className="codicon codicon-close" />
+              {isCodex ? <X aria-hidden="true" /> : <span className="codicon codicon-close" />}
             </button>
           </div>
         ) : (
@@ -127,7 +133,7 @@ export function ChatHeader({
             </div>
             {titleEditable && (
               <button className="session-title-edit-btn" onClick={startEditing} aria-label="Edit session title">
-                <span className="codicon codicon-edit" />
+                {isCodex ? <Pencil aria-hidden="true" /> : <span className="codicon codicon-edit" />}
               </button>
             )}
           </div>
@@ -137,7 +143,7 @@ export function ChatHeader({
         {currentView === 'chat' && (
           <>
             <button className="icon-button" onClick={onNewSession} data-tooltip={t('common.newSession')} aria-label={t('common.newSession')}>
-              <span className="codicon codicon-plus" />
+              {isCodex ? <Plus aria-hidden="true" /> : <span className="codicon codicon-plus" />}
             </button>
             <button
               className="icon-button"
@@ -145,7 +151,7 @@ export function ChatHeader({
               data-tooltip={t('common.newTab')}
               aria-label={t('common.newTab')}
             >
-              <span className="codicon codicon-split-horizontal" />
+              {isCodex ? <PanelLeft aria-hidden="true" /> : <span className="codicon codicon-split-horizontal" />}
             </button>
             {onOpenSearch && (
               <button
@@ -154,7 +160,17 @@ export function ChatHeader({
                 data-tooltip={t('chat.search.openTooltip', { defaultValue: 'Search in conversation' })}
                 aria-label={t('chat.search.openTooltip', { defaultValue: 'Search in conversation' })}
               >
-                <span className="codicon codicon-search" />
+                {isCodex ? <Search aria-hidden="true" /> : <span className="codicon codicon-search" />}
+              </button>
+            )}
+            {isCodex && onOpenSubagents && (
+              <button
+                className="icon-button"
+                onClick={onOpenSubagents}
+                data-tooltip={t('chat.codexSubagents.title')}
+                aria-label={t('chat.codexSubagents.title')}
+              >
+                <span className="codicon codicon-hubot" aria-hidden="true" />
               </button>
             )}
             <button
@@ -163,7 +179,7 @@ export function ChatHeader({
               data-tooltip={t('common.history')}
               aria-label={t('common.history')}
             >
-              <span className="codicon codicon-history" />
+              {isCodex ? <History aria-hidden="true" /> : <span className="codicon codicon-history" />}
             </button>
             <button
               className="icon-button"
@@ -171,7 +187,7 @@ export function ChatHeader({
               data-tooltip={t('common.settings')}
               aria-label={t('common.settings')}
             >
-              <span className="codicon codicon-settings-gear" />
+              {isCodex ? <Settings2 aria-hidden="true" /> : <span className="codicon codicon-settings-gear" />}
             </button>
           </>
         )}

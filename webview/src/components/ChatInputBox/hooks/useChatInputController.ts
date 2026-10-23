@@ -33,7 +33,9 @@ interface UseChatInputControllerOptions
     | 'attachments'
     | 'value'
     | 'onSubmit'
+    | 'codexFollowUpMode'
     | 'onInput'
+    | 'preserveInputUntilSubmitAccepted'
     | 'onAddAttachment'
     | 'onRemoveAttachment'
     | 'onModeSelect'
@@ -70,7 +72,9 @@ export function useChatInputController({
   attachments: externalAttachments,
   value,
   onSubmit,
+  codexFollowUpMode,
   onInput,
+  preserveInputUntilSubmitAccepted,
   onAddAttachment,
   onRemoveAttachment,
   onModeSelect,
@@ -214,6 +218,8 @@ export function useChatInputController({
     dollarCommandCompletion,
     recordInputHistory,
     onSubmit,
+    preserveInputUntilSubmitAccepted,
+    draftScopeKey: `${currentProvider}\u0000${sessionCtx?.currentSessionId ?? ''}`,
     onInstallSdk,
     addToast,
     t,
@@ -274,6 +280,8 @@ export function useChatInputController({
     isComposingRef,
     lastCompositionEndTimeRef,
     sendShortcut,
+    currentProvider,
+    codexFollowUpMode,
     fileCompletion,
     commandCompletion,
     agentCompletion,
@@ -307,6 +315,8 @@ export function useChatInputController({
     isComposingRef,
     lastCompositionEndTimeRef,
     sendShortcut,
+    currentProvider,
+    codexFollowUpMode,
     fileCompletion,
     commandCompletion,
     agentCompletion,

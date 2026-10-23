@@ -123,6 +123,58 @@ describe('useDragSort', () => {
     expect(onSort).toHaveBeenCalledWith(['provider-b', 'provider-c', 'provider-a']);
   });
 
+  it('waits for the configured pointer distance before starting a drag', () => {
+    const onSort = vi.fn();
+    const source = document.createElement('div');
+    const target = document.createElement('div');
+    target.dataset.dragSortId = 'provider-c';
+    vi.spyOn(document, 'elementFromPoint').mockReturnValue(target);
+    const items: TestItem[] = [
+      { id: 'provider-a', label: 'Provider A' },
+      { id: 'provider-b', label: 'Provider B' },
+      { id: 'provider-c', label: 'Provider C' },
+    ];
+    const { result } = renderHook(() => useDragSort({ items, onSort, activationDistance: 6 }));
+
+    act(() => {
+      result.current.handlePointerDown({
+        button: 0, target: source, currentTarget: source, clientX: 10, clientY: 10,
+        preventDefault: vi.fn(), stopPropagation: vi.fn(),
+      } as unknown as React.PointerEvent, 'provider-a');
+      window.dispatchEvent(new PointerEvent('pointermove', { clientX: 13, clientY: 10 }));
+    });
+    expect(result.current.draggedId).toBeNull();
+    expect(document.body.querySelector('[data-drag-sort-preview="true"]')).toBeNull();
+
+    act(() => {
+      window.dispatchEvent(new PointerEvent('pointermove', { clientX: 16, clientY: 10 }));
+      window.dispatchEvent(new PointerEvent('pointerup', { clientX: 16, clientY: 10 }));
+    });
+
+    expect(onSort).toHaveBeenCalledWith(['provider-b', 'provider-c', 'provider-a']);
+  });
+
+  it('does not sort when released before the configured activation distance', () => {
+    const onSort = vi.fn();
+    const source = document.createElement('div');
+    const { result } = renderHook(() => useDragSort({
+      items: [{ id: 'provider-a', label: 'Provider A' }, { id: 'provider-b', label: 'Provider B' }],
+      onSort,
+      activationDistance: 6,
+    }));
+
+    act(() => {
+      result.current.handlePointerDown({
+        button: 0, target: source, currentTarget: source, clientX: 10, clientY: 10,
+        preventDefault: vi.fn(), stopPropagation: vi.fn(),
+      } as unknown as React.PointerEvent, 'provider-a');
+      window.dispatchEvent(new PointerEvent('pointerup', { clientX: 11, clientY: 10 }));
+    });
+
+    expect(onSort).not.toHaveBeenCalled();
+    expect(result.current.draggedId).toBeNull();
+  });
+
   it('does not start pointer sorting from interactive controls', () => {
     const onSort = vi.fn();
     const button = document.createElement('button');

@@ -38,6 +38,8 @@ interface UseDragSortOptions<T extends DragSortItem> {
    * `createEdgeInsertResolver` to enable insert-between slots.
    */
   resolveDropTarget?: (x: number, y: number) => DropTarget | null;
+  /** Distance in CSS pixels the pointer must move before pointer sorting starts. Defaults to 0. */
+  activationDistance?: number;
 }
 
 interface UseDragSortReturn<T extends DragSortItem> {
@@ -215,6 +217,7 @@ export function useDragSort<T extends DragSortItem>({
   onSort,
   pinnedIds = [],
   resolveDropTarget,
+  activationDistance = 0,
 }: UseDragSortOptions<T>): UseDragSortReturn<T> {
   const [draggedId, setDraggedId] = useState<string | null>(null);
   const [dragOverId, setDragOverId] = useState<string | null>(null);
@@ -310,19 +313,37 @@ export function useDragSort<T extends DragSortItem>({
     e.stopPropagation();
 
     pointerAbortRef.current?.abort();
-    draggedIdRef.current = id;
-    lastPointerPosRef.current = { x: e.clientX, y: e.clientY };
-    setDraggedId(id);
-    setDragOverId(null);
-    dragPreviewRef.current?.remove();
-    const { preview, offset } = createDragPreview(previewElement ?? e.currentTarget as HTMLElement, e.clientX, e.clientY);
-    dragPreviewRef.current = preview;
-    dragPreviewOffsetRef.current = offset;
+    clearDragState();
+    const source = previewElement ?? e.currentTarget as HTMLElement;
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const minDistance = Math.max(0, activationDistance);
 
     const abortController = new AbortController();
     pointerAbortRef.current = abortController;
 
+    const activateDrag = (x: number, y: number) => {
+      if (draggedIdRef.current !== null) return;
+      draggedIdRef.current = id;
+      lastPointerPosRef.current = { x, y };
+      setDraggedId(id);
+      setDragOverId(null);
+      dragPreviewRef.current?.remove();
+      const { preview, offset } = createDragPreview(source, startX, startY);
+      dragPreviewRef.current = preview;
+      dragPreviewOffsetRef.current = offset;
+      moveDragPreview(preview, x, y, offset);
+    };
+
+    if (minDistance === 0) activateDrag(startX, startY);
+
     window.addEventListener('pointermove', (event) => {
+      if (draggedIdRef.current === null) {
+        const deltaX = event.clientX - startX;
+        const deltaY = event.clientY - startY;
+        if (Math.hypot(deltaX, deltaY) < minDistance) return;
+        activateDrag(event.clientX, event.clientY);
+      }
       if (dragPreviewRef.current) {
         moveDragPreview(dragPreviewRef.current, event.clientX, event.clientY, dragPreviewOffsetRef.current);
       }
@@ -340,10 +361,12 @@ export function useDragSort<T extends DragSortItem>({
     }, { capture: true, signal: abortController.signal });
 
     window.addEventListener('pointerup', (event) => {
-      const target = resolveDropTargetRef.current(event.clientX, event.clientY);
+      const target = draggedIdRef.current === id
+        ? resolveDropTargetRef.current(event.clientX, event.clientY)
+        : null;
       abortController.abort();
       pointerAbortRef.current = null;
-      sortDraggedToTarget(target);
+      if (draggedIdRef.current === id) sortDraggedToTarget(target);
     }, { once: true, signal: abortController.signal });
 
     window.addEventListener('pointercancel', () => {
@@ -351,7 +374,7 @@ export function useDragSort<T extends DragSortItem>({
       pointerAbortRef.current = null;
       clearDragState();
     }, { once: true, signal: abortController.signal });
-  }, [clearDragState, sortDraggedToTarget, updateDragOver]);
+  }, [activationDistance, clearDragState, sortDraggedToTarget, updateDragOver]);
 
   const handleDragStart = useCallback((e: React.DragEvent, id: string) => {
     e.stopPropagation();

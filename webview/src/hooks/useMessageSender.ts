@@ -40,6 +40,46 @@ function shouldSendReasoningEffort(provider: string, model: string): boolean {
   return claudeModelAllowsEffort(model);
 }
 
+function buildUserContentBlocks(text: string, attachments: Attachment[] | undefined): ClaudeContentBlock[] {
+  const blocks: ClaudeContentBlock[] = [];
+  const hasImageAttachments = Array.isArray(attachments)
+    && attachments.some((attachment) => attachment.mediaType?.startsWith('image/'));
+
+  for (const attachment of attachments ?? []) {
+    if (attachment.mediaType?.startsWith('image/')) {
+      blocks.push({
+        type: 'image',
+        src: `data:${attachment.mediaType};base64,${attachment.data}`,
+        mediaType: attachment.mediaType,
+      });
+    } else {
+      blocks.push({ type: 'attachment', fileName: attachment.fileName, mediaType: attachment.mediaType });
+    }
+  }
+
+  if (text && !(hasImageAttachments && text.trim().startsWith('[Uploaded '))) {
+    blocks.push({ type: 'text', text });
+  }
+  return blocks;
+}
+
+export type CodexQueueInputBlock = { type: 'text'; text: string } | { type: 'image'; url: string };
+
+export function hasUnsupportedCodexQueueAttachment(attachments?: Attachment[]): boolean {
+  return Boolean(attachments?.some((attachment) => !attachment.mediaType.startsWith('image/')));
+}
+
+/** Builds the same user blocks as a normal send, encoded for native queue/steer input. */
+export function buildCodexQueueInput(content: string, attachments?: Attachment[]): CodexQueueInputBlock[] {
+  if (hasUnsupportedCodexQueueAttachment(attachments)) return [];
+  const text = expandQuoteTokens(content).replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+  return buildUserContentBlocks(text, attachments).flatMap<CodexQueueInputBlock>((block) => {
+    if (block.type === 'text' && block.text) return [{ type: 'text', text: block.text }];
+    if (block.type === 'image' && block.src) return [{ type: 'image', url: block.src }];
+    return [];
+  });
+}
+
 export interface UseMessageSenderOptions {
   t: TFunction;
   addToast: (message: string, type?: 'info' | 'success' | 'warning' | 'error') => void;
@@ -274,46 +314,6 @@ export function useMessageSender({
   }, [t, setMessages]);
 
   /**
-   * Build content blocks for the user message
-   */
-  const buildUserContentBlocks = useCallback((
-    text: string,
-    attachments: Attachment[] | undefined
-  ): ClaudeContentBlock[] => {
-    const blocks: ClaudeContentBlock[] = [];
-
-    const hasImageAttachments = Array.isArray(attachments) &&
-      attachments.some(att => att.mediaType?.startsWith('image/'));
-
-    if (Array.isArray(attachments) && attachments.length > 0) {
-      for (const att of attachments) {
-        if (att.mediaType?.startsWith('image/')) {
-          blocks.push({
-            type: 'image',
-            src: `data:${att.mediaType};base64,${att.data}`,
-            mediaType: att.mediaType,
-          });
-        } else {
-          blocks.push({
-            type: 'attachment',
-            fileName: att.fileName,
-            mediaType: att.mediaType,
-          });
-        }
-      }
-    }
-
-    // Filter placeholder text: skip if there are image attachments and text is placeholder
-    const isPlaceholderText = text && text.trim().startsWith('[Uploaded ');
-
-    if (text && !(hasImageAttachments && isPlaceholderText)) {
-      blocks.push({ type: 'text', text });
-    }
-
-    return blocks;
-  }, []);
-
-  /**
    * Send message to backend
    */
   const sendMessageToBackend = useCallback((
@@ -503,7 +503,6 @@ export function useMessageSender({
     dshPreset,
     permissionMode,
     selectedAgent,
-    buildUserContentBlocks,
     sendMessageToBackend,
     addToast,
     t,

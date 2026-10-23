@@ -50,6 +50,12 @@ const QuoteIcon = () => (
   </svg>
 );
 
+const ForkIcon = () => (
+  <svg width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <path d="M5 3.5v4a2 2 0 0 0 2 2h3.5M10 7.5l2 2-2 2M5 2a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3ZM5 11a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3Z" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+  </svg>
+);
+
 interface QuoteButtonProps {
   className?: string;
   isQuoted: boolean;
@@ -139,6 +145,9 @@ interface AssistantMessageActionsProps {
   isCopied: boolean;
   onQuote: () => void;
   onCopy: () => void;
+  showFork?: boolean;
+  onFork?: () => void;
+  codexLayout?: boolean;
   t: TFunction;
 }
 
@@ -151,25 +160,42 @@ export const AssistantMessageActions = memo(function AssistantMessageActions({
   isCopied,
   onQuote,
   onCopy,
+  showFork = false,
+  onFork,
+  codexLayout = false,
   t,
 }: AssistantMessageActionsProps) {
-  if (messageType !== 'assistant' || isMessageStreaming || !hasCopyableText) return null;
-  return (
+  if (messageType !== 'assistant' || isMessageStreaming || (!hasCopyableText && !showFork)) return null;
+  const actions = (
     <>
-      <QuoteButton
-        isQuoted={isQuoted}
-        onClick={onQuote}
-        quoteLabel={t('markdown.quoteMessage', 'Quote message')}
-        quoteSuccessText={t('markdown.quoteSuccess', 'Quoted!')}
-      />
-      <CopyButton
-        isCopied={isCopied}
-        onClick={onCopy}
-        copyLabel={t('markdown.copyMessage')}
-        copySuccessText={t('markdown.copySuccess')}
-      />
+      {hasCopyableText && <>
+        <QuoteButton
+          isQuoted={isQuoted}
+          onClick={onQuote}
+          quoteLabel={t('markdown.quoteMessage', 'Quote message')}
+          quoteSuccessText={t('markdown.quoteSuccess', 'Quoted!')}
+        />
+        <CopyButton
+          isCopied={isCopied}
+          onClick={onCopy}
+          copyLabel={t('markdown.copyMessage')}
+          copySuccessText={t('markdown.copySuccess')}
+        />
+      </>}
+      {showFork && onFork && (
+        <button
+          type="button"
+          className="message-copy-btn message-fork-btn"
+          onClick={onFork}
+          title={t('chat.codexFork.label')}
+          aria-label={t('chat.codexFork.label')}
+        >
+          <span className="copy-icon"><ForkIcon /></span>
+        </button>
+      )}
     </>
   );
+  return codexLayout ? <div className="turn-action-controls">{actions}</div> : actions;
 });
 
 /** Role label for non-user/assistant messages — hidden for notification types */

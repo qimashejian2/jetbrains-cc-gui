@@ -45,6 +45,46 @@
   transition: background 0.15s, opacity 0.15s;
 }
 
+.button-area[data-provider="codex"] .submit-button {
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  color: var(--bg-chat);
+  background: var(--text-primary);
+}
+
+.button-area[data-provider="codex"] .submit-button:disabled {
+  background: var(--text-tertiary);
+  opacity: 0.4;
+}
+
+.button-area[data-provider="codex"] .enhance-prompt-button {
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+}
+
+.codex-lucide-spinner {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  border: 1.75px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: codex-spin 0.8s linear infinite;
+}
+
+.codex-queue-spinner {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  animation: codex-spin 0.8s linear infinite;
+}
+
+@keyframes codex-spin {
+  to { transform: rotate(360deg); }
+}
+
 .submit-button:hover:not(:disabled) {
   opacity: 0.85;
 }

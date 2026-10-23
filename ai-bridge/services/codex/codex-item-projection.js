@@ -1,5 +1,7 @@
 /** Shared native item projection for live streaming and persisted history. */
-export function projectCodexItemMessages(item, { threadId = null, turnId = null, authoritative = false, kind = null } = {}) {
+export function projectCodexItemMessages(item, {
+  threadId = null, turnId = null, turnStatus = null, authoritative = false, kind = null,
+} = {}) {
   const messages = [];
   if (!item || typeof item !== 'object') return messages;
   const emit = (line) => messages.push(JSON.parse(line.slice('[MESSAGE] '.length)));
@@ -12,6 +14,7 @@ export function projectCodexItemMessages(item, { threadId = null, turnId = null,
       uuid: itemId ? `codex:${threadId}:${turnId}:${itemId}` : undefined,
       codexItemType: type ?? 'unknown',
       ...(item.phase ? { codexPhase: item.phase } : {}),
+      ...(typeof turnStatus === 'string' ? { codexTurnStatus: turnStatus } : {}),
       codexAuthoritative: authoritative,
       codexSnapshot: true,
     };
@@ -158,9 +161,9 @@ export function projectCodexItemMessages(item, { threadId = null, turnId = null,
       return messages;
     }
     if (type === 'reasoning') {
-      const texts = [...(Array.isArray(item.summary) ? item.summary : []), ...(Array.isArray(item.content) ? item.content : [])]
+      const texts = [...(Array.isArray(item.summary) ? item.summary : [])]
         .map((entry) => typeof entry === 'string' ? entry : entry?.text).filter((entry) => typeof entry === 'string' && entry);
-      // A native reasoning item proves activity even when its readable summary is unavailable.
+      // Only the App Server's public summary is renderable; reasoning content is private.
       const status = item.status ?? (authoritative ? 'completed' : 'inProgress');
       const blocks = (texts.length ? texts : ['']).map((text) => ({
         type: 'thinking', thinking: text, text, native: true, status,

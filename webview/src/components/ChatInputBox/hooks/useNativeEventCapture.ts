@@ -1,10 +1,13 @@
 import { useEffect, useEffectEvent, useLayoutEffect, useRef } from 'react';
-import type { SendShortcut } from '../types.js';
+import type { CodexFollowUpMode, SendShortcut } from '../types.js';
 import {
   catchStrayEnter,
   claimEnterPress,
   isEnterKey,
+  isFollowUpOverrideKey,
+  isImeStillHoldingEnter,
   isSendKey,
+  oppositeFollowUpMode,
   releaseEnterKeyUp,
   releaseEnterPress,
   triageEnterKeyDown,
@@ -18,12 +21,14 @@ interface CompletionOpenLike {
 export interface UseNativeEventCaptureOptions extends EnterKeyRefs {
   editableRef: React.RefObject<HTMLDivElement | null>;
   sendShortcut: SendShortcut;
+  currentProvider?: string;
+  codexFollowUpMode?: CodexFollowUpMode;
   fileCompletion: CompletionOpenLike;
   commandCompletion: CompletionOpenLike;
   agentCompletion: CompletionOpenLike;
   promptCompletion: CompletionOpenLike;
   dollarCommandCompletion: CompletionOpenLike;
-  handleSubmit: () => void;
+  handleSubmit: (followUpMode?: CodexFollowUpMode) => void;
   handleEnhancePrompt: () => void;
   handleCompositionEnd: () => void;
 }
@@ -48,7 +53,7 @@ function isAnyCompletionOpen(options: UseNativeEventCaptureOptions): boolean {
  * - prompt enhancer shortcut (Cmd+/)
  */
 export function useNativeEventCapture(options: UseNativeEventCaptureOptions): void {
-  const { editableRef, sendShortcut, handleSubmit, handleEnhancePrompt } = options;
+  const { editableRef, sendShortcut, currentProvider = 'claude', codexFollowUpMode, handleSubmit, handleEnhancePrompt } = options;
   const enterWasComposingRef = useRef(false);
   // useEffectEvent keeps the first committed submit in JCEF. Enter would then
   // still see the initial Claude frame, where SDK status is loading and the
@@ -96,7 +101,19 @@ export function useNativeEventCapture(options: UseNativeEventCaptureOptions): vo
     // Open completion menus read Enter through the React handler.
     // completionOpenRef, not the effect-event options: JCEF can keep this
     // callback on the first frame, where every menu is still closed.
-    if (completionOpenRef.current || !isSendKey(sendShortcut, ev)) return;
+    if (completionOpenRef.current) return;
+
+    if (currentProvider === 'codex' && codexFollowUpMode && isFollowUpOverrideKey(ev)) {
+      if (isImeStillHoldingEnter(sendShortcut, options, ev.isComposing, ev.metaKey || ev.ctrlKey)) {
+        claimEnterPress(ev, options);
+        return;
+      }
+      claimEnterPress(ev, options);
+      handleSubmitRef.current(oppositeFollowUpMode(codexFollowUpMode));
+      return;
+    }
+
+    if (!isSendKey(sendShortcut, ev)) return;
 
     claimEnterPress(ev, options);
     handleSubmitRef.current();

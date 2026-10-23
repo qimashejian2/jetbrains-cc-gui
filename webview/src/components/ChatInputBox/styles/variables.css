@@ -72,3 +72,12 @@
   --success-color: #107c10;
   --context-bar-bg: #f0f0f0;
 }
+
+/* The VS Code Codex composer uses a raised surface without a focus outline. */
+.chat-input-box[data-provider="codex"] {
+  --input-bg: var(--bg-tertiary);
+  --input-border: transparent;
+  --input-focus-border: transparent;
+  --input-placeholder: var(--text-tertiary);
+  --context-bar-bg: transparent;
+}

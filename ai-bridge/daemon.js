@@ -85,6 +85,14 @@ import {
   codexListSkillsPersistent,
   codexGetMcpStatusPersistent,
   codexReloadMcpPersistent,
+  codexQueueAddPersistent,
+  codexQueueListPersistent,
+  codexQueueUpdatePersistent,
+  codexQueueDeletePersistent,
+  codexQueueReorderPersistent,
+  codexQueueStartPersistent,
+  codexSteerPersistent,
+  codexForkThreadPersistent,
   codexShutdownPersistentRuntimes,
   getCodexRuntimeSnapshot,
   setCodexPristineBaseEnv,
@@ -935,6 +943,51 @@ async function runDaemonMain() {
           _originalStderrWrite('[daemon] codex.abortTurn error: ' + (e.message || String(e)) + '\n');
           writeRawLine({ id: abortId, done: true, success: false, error: e.message || String(e) });
         });
+      return;
+    }
+
+    // VS Code parity: steering feeds mid-flight input to the active turn. It
+    // bypasses the FIFO like abort — waiting behind the turn it targets would
+    // deadlock — and surfaces typed errors for the UI to fall back to send.
+    if (request.method === 'codex.steer') {
+      const steerId = request.id || '0';
+      Promise.resolve(codexSteerPersistent(request.params || {}))
+        .then((result) => writeRawLine({ id: steerId, done: true, success: true,
+          result: result ?? null, error: null, code: null }))
+        .catch((e) => {
+          _originalStderrWrite('[daemon] codex.steer error: ' + (e.message || String(e)) + '\n');
+          writeRawLine({ id: steerId, done: true, success: false,
+            result: e?.result ?? e?.data ?? null,
+            error: e?.message || String(e), code: e?.code ?? 'UNKNOWN' });
+        });
+      return;
+    }
+
+    // Native thread/turn mutations bypass the send FIFO and the read-only
+    // command table. This lets queue/fork complete while codex.send is waiting
+    // for a turn terminal, with one typed result envelope per daemon request.
+    const codexNativeThreadMethods = new Map([
+      ['codex.queueAdd', codexQueueAddPersistent],
+      ['codex.queueList', codexQueueListPersistent],
+      ['codex.queueUpdate', codexQueueUpdatePersistent],
+      ['codex.queueDelete', codexQueueDeletePersistent],
+      ['codex.queueReorder', codexQueueReorderPersistent],
+      ['codex.queueStart', codexQueueStartPersistent],
+      ['codex.fork', codexForkThreadPersistent],
+    ]);
+    const nativeHandler = codexNativeThreadMethods.get(request.method);
+    if (nativeHandler) {
+      const nativeId = request.id || '0';
+      if (!request.id) {
+        _originalStderrWrite(`[daemon] ${request.method} arrived without request.id; response may be orphaned\n`, 'utf8');
+      }
+      Promise.resolve()
+        .then(() => nativeHandler(request.params || {}))
+        .then((result) => writeRawLine({ id: nativeId, done: true, success: true,
+          result: result ?? null, error: null, code: null }))
+        .catch((error) => writeRawLine({ id: nativeId, done: true, success: false,
+          result: error?.result ?? error?.data ?? null,
+          error: error?.message || String(error), code: error?.code ?? 'UNKNOWN' }));
       return;
     }
 

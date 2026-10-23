@@ -38,10 +38,11 @@ const StatusPanel = ({ todos, fileChanges, subagents, subagentHistories, current
   }, [todos]);
 
   // Calculate subagent stats
-  const { subagentCompletedCount, subagentTotalCount, hasRunningSubagent } = useMemo(() => {
-    const completed = subagents.filter((s) => s.status === 'completed').length;
-    const running = subagents.some((s) => s.status === 'running');
-    return { subagentCompletedCount: completed, subagentTotalCount: subagents.length, hasRunningSubagent: running };
+  const { subagentDoneCount, subagentTotalCount, hasRunningSubagent, waitingSubagentCount } = useMemo(() => {
+    const done = subagents.filter((s) => s.status === 'completed' || s.status === 'error').length;
+    const waiting = subagents.filter((s) => s.status === 'waiting').length;
+    const active = subagents.some((s) => s.status === 'running' || s.status === 'waiting');
+    return { subagentDoneCount: done, subagentTotalCount: subagents.length, hasRunningSubagent: active, waitingSubagentCount: waiting };
   }, [subagents]);
 
   // Calculate total file changes stats
@@ -328,7 +329,12 @@ const StatusPanel = ({ todos, fileChanges, subagents, subagentHistories, current
           <span className="tab-label">{t('statusPanel.subagentTab')}</span>
           {hasSubagents && (
             <span className="tab-progress">
-              {subagentCompletedCount}/{subagentTotalCount}
+              {subagentDoneCount}/{subagentTotalCount}
+            </span>
+          )}
+          {currentProvider === 'codex' && waitingSubagentCount > 0 && (
+            <span className="tab-waiting-count">
+              {t('chat.codexSubagents.waitingCount', { count: waitingSubagentCount })}
             </span>
           )}
           {isStreaming && hasRunningSubagent && (

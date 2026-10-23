@@ -122,7 +122,9 @@ export async function readNativeHistoryPage(read, { threadId, cursor = null, lim
         && (RUNNING_TOOL_TYPES.has(item.type) || item.type === 'reasoning')
         && (['inProgress', 'in_progress'].includes(item.status) || legacyImageStarted || reasoningWithoutStatus)
         ? { ...item, status: turn.status } : legacyImageStarted ? { ...item, status: 'in_progress' } : item;
-      for (const raw of projectCodexItemMessages(displayItem, { threadId, turnId, authoritative: true })) {
+      for (const raw of projectCodexItemMessages(displayItem, {
+        threadId, turnId, turnStatus: turn.status, authoritative: true,
+      })) {
         raw.historySource = 'native';
         const blocks = raw.message?.content ?? [];
         const itemTime = entry.completedAtMs ?? entry.startedAtMs ?? item.completedAtMs ?? item.startedAtMs;

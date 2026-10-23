@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { Bot, Check, ChevronDown, ChevronUp, Hand, ListChecks, ShieldCheck, Sparkles, Zap } from 'lucide-react';
 import { AVAILABLE_MODES, type ModeInfo, type ModelInfo, type PermissionMode } from '../types';
 import { useOmpRoles } from '../../../hooks/providers/useCliModels';
 import { useDropdownPosition } from '../../../hooks/useDropdownPosition';
@@ -23,6 +24,18 @@ const OMP_ROLE_ICONS: Record<string, string> = {
   slow: 'codicon-lightbulb',
   plan: 'codicon-tasklist',
 };
+
+function CodexModeIcon({ mode }: { mode: PermissionMode }) {
+  const props = { className: 'codex-selector-icon', 'aria-hidden': true as const };
+  switch (mode) {
+    case 'default': return <Hand {...props} />;
+    case 'plan': return <ListChecks {...props} />;
+    case 'acceptEdits': return <Bot {...props} />;
+    case 'auto': return <ShieldCheck {...props} />;
+    case 'bypassPermissions': return <Zap {...props} />;
+    default: return <Sparkles {...props} />;
+  }
+}
 
 /**
  * Maps a dynamic omp role (listModels payload) to a ModeInfo. Label is the
@@ -194,9 +207,15 @@ export const ModeSelect = ({
         onClick={handleToggle}
         title={getModeText(currentMode.id, 'tooltip') || `${t('chat.currentMode', { mode: getModeText(currentMode.id, 'label') })}`}
       >
-        <span className={`codicon ${currentMode.icon}`} />
+        {provider === 'codex'
+          ? <CodexModeIcon mode={currentMode.id} />
+          : <span className={`codicon ${currentMode.icon}`} />}
         <span className="selector-button-text">{getModeText(currentMode.id, 'shortLabel')}</span>
-        <span className={`codicon codicon-chevron-${isOpen ? 'up' : 'down'}`} style={CHEVRON_ICON_STYLE} />
+        {provider === 'codex'
+          ? isOpen
+            ? <ChevronUp className="codex-selector-chevron" aria-hidden="true" />
+            : <ChevronDown className="codex-selector-chevron" aria-hidden="true" />
+          : <span className={`codicon codicon-chevron-${isOpen ? 'up' : 'down'}`} style={CHEVRON_ICON_STYLE} />}
       </button>
 
       {isOpen && (
@@ -222,13 +241,17 @@ export const ModeSelect = ({
               title={getModeText(mode.id, 'tooltip')}
               style={getModeOptionStyle(!!mode.disabled)}
             >
-              <span className={`codicon ${mode.icon}`} />
+              {provider === 'codex'
+                ? <CodexModeIcon mode={mode.id} />
+                : <span className={`codicon ${mode.icon}`} />}
               <div style={MODE_INFO_STYLE}>
                 <span style={MODE_TEXT_STYLE}>{getModeText(mode.id, 'label')}</span>
                 <span className="mode-description" style={MODE_TEXT_STYLE}>{getModeText(mode.id, 'description')}</span>
               </div>
               {mode.id === value && (
-                <span className="codicon codicon-check check-mark" />
+                provider === 'codex'
+                  ? <Check className="codex-selector-icon check-mark" aria-hidden="true" />
+                  : <span className="codicon codicon-check check-mark" />
               )}
             </div>
           ))}

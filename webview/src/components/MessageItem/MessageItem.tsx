@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo, memo, useEffect, useRef } from 'react';
+import { useState, useCallback, useMemo, memo, useEffect, useRef, useContext } from 'react';
 import type { TFunction } from 'i18next';
 import type { ClaudeMessage, ClaudeContentBlock, ToolResultBlock } from '../../types';
 
@@ -13,6 +13,7 @@ import { isNonRenderedToolUse } from '../../utils/toolConstants';
 import { shouldRevealThinking } from '../../utils/thinkingVisibility';
 import { groupBlocks } from './groupBlocks';
 import { ImageBlock } from './blocks/ImageBlock';
+import { SessionContext } from '../../contexts/SessionContext';
 
 export interface MessageItemProps {
   message: ClaudeMessage;
@@ -32,6 +33,8 @@ export interface MessageItemProps {
   toolResultSignature?: string;
   /** Current active provider id (e.g. 'claude', 'codex'); drives the streaming-connect label. */
   currentProvider?: string;
+  /** Current session id, with SessionContext as the app-level fallback. */
+  currentSessionId?: string | null;
   /** Show opt-in detailed footer extras such as turn cost and cache-hit ratio. */
   detailedOutputEnabled?: boolean;
 }
@@ -53,8 +56,10 @@ export const MessageItem = memo(function MessageItem({
   onNavigateToDependencySettings,
   toolResultSignature: _toolResultSignature,
   currentProvider,
+  currentSessionId,
   detailedOutputEnabled = false,
 }: MessageItemProps): React.ReactElement {
+  const sessionContext = useContext(SessionContext);
   const [copiedMessageIndex, setCopiedMessageIndex] = useState<number | null>(null);
   const [quotedMessageIndex, setQuotedMessageIndex] = useState<number | null>(null);
   const [showStreamingConnectHint, setShowStreamingConnectHint] = useState(false);
@@ -98,6 +103,21 @@ export const MessageItem = memo(function MessageItem({
     return '';
   }, [message, extractMarkdownContent]);
   const hasCopyableText = markdownContent.trim().length > 0;
+  const activeSessionId = currentSessionId ?? sessionContext?.currentSessionId ?? null;
+  const rawMetadata = message.raw && typeof message.raw === 'object'
+    ? message.raw as Record<string, unknown> : null;
+  const codexThreadId = typeof rawMetadata?.codexThreadId === 'string' ? rawMetadata.codexThreadId : '';
+  const codexTurnId = typeof rawMetadata?.codexTurnId === 'string' ? rawMetadata.codexTurnId : '';
+  const canForkCodexTurn = currentProvider === 'codex' && message.type === 'assistant'
+    && !isMessageStreaming && Boolean(activeSessionId && codexThreadId === activeSessionId)
+    && codexTurnId.trim().length > 0 && rawMetadata?.codexTurnStatus === 'completed';
+
+  const handleForkCodexTurn = useCallback(() => {
+    if (!canForkCodexTurn || !codexThreadId || !codexTurnId) return;
+    window.dispatchEvent(new CustomEvent('codex-fork-message', {
+      detail: { threadId: codexThreadId, lastTurnId: codexTurnId },
+    }));
+  }, [canForkCodexTurn, codexThreadId, codexTurnId]);
 
   const handleCopyMessage = useCallback(async () => {
     // Prevent copying if message is empty or already in "copied" state
@@ -265,17 +285,6 @@ export const MessageItem = memo(function MessageItem({
         t={t}
       />
 
-      <AssistantMessageActions
-        messageType={message.type}
-        isMessageStreaming={isMessageStreaming}
-        hasCopyableText={hasCopyableText}
-        isQuoted={quotedMessageIndex === messageIndex}
-        isCopied={copiedMessageIndex === messageIndex}
-        onQuote={handleQuoteMessage}
-        onCopy={handleCopyMessage}
-        t={t}
-      />
-
       <MessageRoleLabel messageType={message.type} />
 
       {userImages.length > 0 && <div className="user-message-images">
@@ -309,6 +318,20 @@ export const MessageItem = memo(function MessageItem({
         message={message}
         isMessageStreaming={isMessageStreaming}
         detailedOutputEnabled={detailedOutputEnabled}
+        t={t}
+      />
+
+      <AssistantMessageActions
+        messageType={message.type}
+        isMessageStreaming={isMessageStreaming}
+        hasCopyableText={hasCopyableText}
+        isQuoted={quotedMessageIndex === messageIndex}
+        isCopied={copiedMessageIndex === messageIndex}
+        onQuote={handleQuoteMessage}
+        onCopy={handleCopyMessage}
+        showFork={canForkCodexTurn}
+        onFork={handleForkCodexTurn}
+        codexLayout={currentProvider === 'codex'}
         t={t}
       />
     </div>

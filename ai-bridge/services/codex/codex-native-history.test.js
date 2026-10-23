@@ -221,3 +221,14 @@ test('native terminal projection stays within its own turn and thread while chil
   assert.ok(child.messages.every(message => message.raw.codexThreadId === 'child'
     && message.raw.message.content[0].type === 'tool_use'));
 });
+
+test('native history carries the owning turn status onto projected messages', async () => {
+  for (const status of ['completed', 'failed', 'interrupted', 'inProgress']) {
+    const page = await readNativeHistoryPage(async () => ({ thread: { id: 'thread', turns: [{
+      id: `turn-${status}`, status, items: [{ id: 'answer', type: 'agentMessage', text: 'reply' }],
+    }] } }), { threadId: 'thread', readMode: 'full' });
+    const message = page.messages[0];
+    assert.equal(message.raw.codexTurnId, `turn-${status}`);
+    assert.equal(message.raw.codexTurnStatus, status);
+  }
+});

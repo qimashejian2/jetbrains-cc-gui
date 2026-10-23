@@ -46,16 +46,18 @@ export const WelcomeScreen = memo(function WelcomeScreen({
     <div style={ROOT_STYLE}>
       <div style={LOGO_WRAPPER_STYLE}>
         <BlinkingLogo provider={currentProvider} onProviderChange={onProviderChange} />
-        <span
-          className="version-tag"
-          role="button"
-          tabIndex={0}
-          style={VERSION_TAG_STYLE}
-          onClick={onVersionClick}
-          onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') onVersionClick?.(); }}
-        >
-          v{APP_VERSION}
-        </span>
+        {currentProvider !== 'codex' && (
+          <span
+            className="version-tag"
+            role="button"
+            tabIndex={0}
+            style={VERSION_TAG_STYLE}
+            onClick={onVersionClick}
+            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') onVersionClick?.(); }}
+          >
+            v{APP_VERSION}
+          </span>
+        )}
       </div>
       <div>
         <AnimatedText text={t('chat.sendMessage', { provider: providerLabels[currentProvider] ?? currentProvider })} />

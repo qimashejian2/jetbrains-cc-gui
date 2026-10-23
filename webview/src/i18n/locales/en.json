@@ -55,6 +55,41 @@
     "inputPlaceholder": "@reference files, #invoke agents, !insert prompts, Enter to send",
     "inputPlaceholderEnter": "@reference files, #invoke agents, !insert prompts, Enter to send",
     "inputPlaceholderCmdEnter": "@reference files, #invoke agents, !insert prompts, ⌘Enter to send",
+    "codexCommandBusy": "Wait for the current Codex operation to finish before running this command.",
+    "codexQueue": {
+      "paused": "Queue paused because you interrupted",
+      "resume": "Resume",
+      "edit": "Edit message",
+      "editMessage": "Edit queued message",
+      "save": "Save",
+      "cancel": "Cancel",
+      "attachment": "Attachment",
+      "steer": "Steer",
+      "retry": "Retry",
+      "remove": "Delete queued message",
+      "reorder": "Reorder queued message",
+      "followUpMode": "Codex follow-up behavior",
+      "followUps": "Follow-ups:",
+      "overrideShortcut": "Cmd/Ctrl+Shift+Enter reverses the mode for one message",
+      "modeQueue": "Queue",
+      "modeSteer": "Steer",
+      "useSteer": "Turn off queueing",
+      "useQueue": "Turn on queueing",
+      "moreOptions": "Queued message actions",
+      "preview": "Preview queued message",
+      "previewTitle": "Queued message preview",
+      "closePreview": "Close queued message preview",
+      "unsupportedAttachment": "Codex queue and steer support images only. Remove other attachments and try again."
+    },
+    "codexFork": {
+      "label": "Fork chat from this message",
+      "busy": "Wait for the current Codex turn to finish before forking.",
+      "failed": "Could not fork this Codex chat: {{error}}",
+      "timeout": "The fork request timed out.",
+      "unavailable": "The native Codex bridge is unavailable.",
+      "noThreadId": "The fork response did not include a thread id.",
+      "createdInHistory": "The fork was created and can be opened from history."
+    },
     "noThinkingContent": "No thinking content",
     "parseError": "Failed to parse content",
     "sendMessageEnter": "Send message (Enter)",
@@ -67,6 +102,27 @@
     "addAttachment": "Add attachment",
     "stopGeneration": "Stop generation",
     "generatingResponse": "Generating response",
+    "codexTurnStatus": {
+      "thinking": "Thinking",
+      "tool": "Running tool",
+      "approval": "Waiting for approval",
+      "planning": "Planning",
+      "running": "Working"
+    },
+    "codexSubagents": {
+      "title": "Subagents",
+      "active": "Active",
+      "done": "Done",
+      "waiting": "Waiting",
+      "waitingCount": "{{count}} waiting",
+      "status": {
+        "running": "Running",
+        "waiting": "Waiting",
+        "completed": "Done",
+        "error": "Failed"
+      },
+      "toggleDetails": "Toggle {{name}} details"
+    },
     "elapsedTime": "Elapsed {{time}}",
     "minutesAndSeconds": "{{minutes}}m {{seconds}}s",
     "imagePreview": "Preview",
@@ -1913,6 +1969,19 @@
     "stopped": "Stopped"
   },
   "subagent": {
+    "transcript": {
+      "title": "Subagent conversation",
+      "back": "Back to subagents",
+      "loading": "Loading subagent conversation…",
+      "empty": "No conversation messages are available.",
+      "failed": "Could not load the subagent conversation. {{error}}",
+      "retry": "Retry",
+      "assistant": "Codex",
+      "user": "You",
+      "tool": "Tool output",
+      "summary": "Summary",
+      "emptyToolOutput": "No text output"
+    },
     "process": {
       "title": "Agent process",
       "prompt": "Prompt",

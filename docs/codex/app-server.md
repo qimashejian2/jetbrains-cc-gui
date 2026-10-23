@@ -40,6 +40,14 @@
 
 示例 NDJSON 可由 Node fixture（`persistent-codex-service.test.js`）与 Java fixture 共同解析。
 
+### 原生队列、分支与终态历史
+
+- 队列列表先直接请求 `thread/queue/list`，仅在 `NO_RUNTIME` 或 `STALE_THREAD` 时由 Java 通过 `preconnectCodex` 领取当前窗口的写入租约、恢复线程并重试一次；已加载线程的队列查询不进入长操作 FIFO。Webview 在绑定事件后刷新列表，已有列表请求进行中时不重复发起；原生快照成功后清除旧错误。
+- 忙碌时，裸 `/plan`、`/context`、`/diff`、`/approvals` 仍走对应处理；`/plan <正文>`、`/init`、`/compact`、`/review` 明确提示等待并保留草稿，不把命令文本提交到队列或 `turn/steer`。
+- Fork 请求在 `thread/fork` 前读取 `thread/list` 的全部游标页（包含 archived 与非 archived、所有 source kind），并持久化当前已知 thread ID 作为安全基线。版本 2 隐私记录只遮罩基线之外且未被可信创建记录豁免的 thread；明确的分支专属遮罩和损坏/未知格式状态优先级更高。原生 fork 结果明确拒绝或请求确认未写出时可移除临时记录；超时、断连或结果身份不明时将记录改为持久 quarantine，遮罩该基线之外的 thread，但不阻止后续 Fork。只有直接 `thread/start` 响应，或历史分类继承/保守标记已持久化的 fork，才写入可信 thread ID。无法核实的历史记录继续 fail-closed；旧版全局待处理记录迁移为不含安全基线的 quarantine，因此旧 thread 仍被遮罩，新建且已确认的 thread 可用。
+- Fork 成功信封允许 `error:null`、`code:null`；Java 校验新线程身份后领取独立租约。前端仅在源会话仍未开始新工作时自动打开分支；源消息已变化或正在发送时保留当前会话，并提示从历史记录打开已创建分支。
+- Codex 子代理进入终态后，若缓存消息尚未覆盖该任务的终态回合，则补读一次完整历史；按会话、提供商和任务身份去重，后续任务不能复用旧任务的历史路径。Claude 的展开读取合同不变。
+
 ## 持久 service 运行时状态与恢复
 
 `CodexAppServerService`（`ai-bridge/services/codex/codex-appserver-service.js`）是每个聊天宿主一实例的常驻编排层。状态与恢复语义：

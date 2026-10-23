@@ -1,10 +1,11 @@
 import { useTranslation } from 'react-i18next';
+import { ChevronDown, ChevronUp } from 'lucide-react';
 import type { ClaudeModelMapping } from '../../../utils/claudeModelMapping';
 import { ProviderModelIcon } from '../../shared/ProviderModelIcon';
 import { MODEL_ID_TO_MAPPING_KEY, resolveModelIdForIcon } from '../modelLabelUtils';
 import type { ModelInfo } from '../types';
 
-const CHEVRON_ICON_STYLE: React.CSSProperties = { fontSize: '10px', marginLeft: '2px' };
+const CHEVRON_ICON_STYLE: React.CSSProperties = { marginLeft: '2px' };
 
 interface ModelConfigTriggerProps {
   buttonRef: React.RefObject<HTMLButtonElement | null>;
@@ -53,7 +54,11 @@ export const ModelConfigTrigger = ({
         />
       )}
       <span className="selector-button-text model-config-summary-text">{summaryText}</span>
-      <span className={`codicon codicon-chevron-${isOpen ? 'up' : 'down'}`} style={CHEVRON_ICON_STYLE} />
+      {currentProvider === 'codex'
+        ? isOpen
+          ? <ChevronUp className="codex-selector-chevron" aria-hidden="true" style={CHEVRON_ICON_STYLE} />
+          : <ChevronDown className="codex-selector-chevron" aria-hidden="true" style={CHEVRON_ICON_STYLE} />
+        : <span className={`codicon codicon-chevron-${isOpen ? 'up' : 'down'}`} style={{ ...CHEVRON_ICON_STYLE, fontSize: '10px' }} />}
     </button>
   );
 };

@@ -1,4 +1,4 @@
-import { act, cleanup, render, renderHook } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, renderHook } from '@testing-library/react';
 import { createElement, Suspense, startTransition, useRef, useState } from 'react';
 import type React from 'react';
 import { useKeyboardHandler } from './useKeyboardHandler.js';
@@ -9,6 +9,8 @@ function mountKeyboard(options: {
   sendShortcut?: 'enter' | 'cmdEnter';
   completionOpen?: boolean;
   recentlyComposing?: boolean;
+  currentProvider?: string;
+  codexFollowUpMode?: 'queue' | 'steer';
 } = {}) {
   const handleSubmit = vi.fn();
   const handleSelect = vi.fn();
@@ -25,6 +27,8 @@ function mountKeyboard(options: {
       completionSelectedRef: useRef(false),
       submittedOnEnterRef: useRef(false),
       sendShortcut: options.sendShortcut ?? 'enter',
+      currentProvider: options.currentProvider,
+      codexFollowUpMode: options.codexFollowUpMode,
       fileCompletion: {
         isOpen: completionOpen,
         handleKeyDown: (event) => {
@@ -85,6 +89,58 @@ function createBeforeInputEvent(inputType: string, isComposing = false): InputEv
 }
 
 describe('useNativeEventCapture', () => {
+  it.each([
+    { sendShortcut: 'enter' as const, modifier: 'metaKey' as const },
+    { sendShortcut: 'cmdEnter' as const, modifier: 'ctrlKey' as const },
+  ])('uses Cmd/Ctrl+Shift+Enter once to override queue mode in $sendShortcut mode', ({ sendShortcut, modifier }) => {
+    const fixture = mountKeyboard({ sendShortcut, currentProvider: 'codex', codexFollowUpMode: 'queue' });
+    dispatchEnter(fixture.el, 'keydown', { [modifier]: true, shiftKey: true });
+    expect(fixture.handleSubmit).toHaveBeenCalledExactlyOnceWith('steer');
+  });
+
+  it('keeps the one-shot override out of a recent IME confirmation', () => {
+    const fixture = mountKeyboard({
+      currentProvider: 'codex',
+      codexFollowUpMode: 'queue',
+      recentlyComposing: true,
+    });
+    const event = dispatchEnter(fixture.el, 'keydown', { metaKey: true, shiftKey: true });
+    expect(event.defaultPrevented).toBe(true);
+    expect(fixture.handleSubmit).not.toHaveBeenCalled();
+  });
+
+  it('uses the React keyboard fallback for one-shot follow-up overrides', () => {
+    const handleSubmit = vi.fn();
+    const closed = { isOpen: false, handleKeyDown: () => false };
+    function Fixture() {
+      const refs = {
+        isComposingRef: useRef(false),
+        lastCompositionEndTimeRef: useRef(Date.now() - 1000),
+        completionSelectedRef: useRef(false),
+        submittedOnEnterRef: useRef(false),
+      };
+      const keys = useKeyboardHandler({
+        ...refs,
+        sendShortcut: 'enter',
+        currentProvider: 'codex',
+        codexFollowUpMode: 'steer',
+        fileCompletion: closed,
+        commandCompletion: closed,
+        agentCompletion: closed,
+        promptCompletion: closed,
+        dollarCommandCompletion: closed,
+        handleMacCursorMovement: () => false,
+        handleHistoryKeyDown: () => false,
+        handleSubmit,
+      });
+      return createElement('div', { onKeyDown: keys.onKeyDown });
+    }
+
+    const view = render(createElement(Fixture));
+    fireEvent.keyDown(view.container.firstElementChild!, { key: 'Enter', metaKey: true, shiftKey: true });
+    expect(handleSubmit).toHaveBeenCalledExactlyOnceWith('queue');
+  });
+
   afterEach(() => {
     cleanup();
     document.body.innerHTML = '';

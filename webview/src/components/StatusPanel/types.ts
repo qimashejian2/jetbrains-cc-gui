@@ -35,6 +35,7 @@ export const statusIconMap: Record<TodoItem['status'], string> = {
 
 export const subagentStatusIconMap: Record<SubagentInfo['status'], string> = {
   running: 'codicon-loading',
+  waiting: 'codicon-watch',
   completed: 'codicon-check',
   error: 'codicon-error',
 };

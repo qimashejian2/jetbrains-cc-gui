@@ -11,8 +11,34 @@ type ViewMode = 'chat' | 'history' | 'settings';
 
 type ToastType = 'info' | 'success' | 'warning' | 'error';
 
+const CODEX_FORK_PENDING_TIMEOUT_MS = 130_000;
+
 const createSessionTransitionToken = () =>
   `transition-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
+function createCodexForkRequestId(): string {
+  return typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `codex-fork-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function forkResultThreadId(value: unknown): string | null {
+  const result = record(value);
+  const threadId = record(result?.thread)?.id;
+  return typeof threadId === 'string' && threadId.trim() ? threadId.trim() : null;
+}
+
+function forkErrorMessage(value: unknown): string | undefined {
+  if (typeof value === 'string') return value;
+  const error = record(value);
+  return typeof error?.message === 'string' ? error.message : undefined;
+}
 
 interface UseSessionManagementOptions {
   messages: ClaudeMessage[];
@@ -334,6 +360,131 @@ export function useSessionManagement({
     }));
     setCurrentView('chat');
   }, [applyHistoryModel, beginSessionTransition, currentProvider, loading, setCurrentView, currentSessionId]);
+
+  // Fork requests are emitted from MessageItem so the message list does not
+  // need another prop chain. Results are correlated by requestId and only a
+  // returned native thread id can enter the existing load_session flow.
+  const forkSessionScopeRef = useRef({ currentSessionId, currentProvider, messages, loading, loadHistorySession });
+  forkSessionScopeRef.current = { currentSessionId, currentProvider, messages, loading, loadHistorySession };
+  const pendingForksRef = useRef(new Map<string, {
+    sourceThreadId: string;
+    lastTurnId: string;
+    sourceMessages: ClaudeMessage[];
+    timeoutId: ReturnType<typeof setTimeout>;
+  }>());
+
+  useEffect(() => {
+    const finishRequest = (requestId: string) => {
+      const pending = pendingForksRef.current.get(requestId);
+      if (!pending) return;
+      clearTimeout(pending.timeoutId);
+      pendingForksRef.current.delete(requestId);
+    };
+
+    const onForkMessage = (event: Event) => {
+      const detail = (event as CustomEvent<{ threadId?: unknown; lastTurnId?: unknown }>).detail;
+      const threadId = typeof detail?.threadId === 'string' ? detail.threadId.trim() : '';
+      const lastTurnId = typeof detail?.lastTurnId === 'string' ? detail.lastTurnId.trim() : '';
+      const scope = forkSessionScopeRef.current;
+      if (scope.loading) {
+        addToast(t('chat.codexFork.busy'), 'warning');
+        return;
+      }
+      if (scope.currentProvider !== 'codex' || !scope.currentSessionId
+          || threadId !== scope.currentSessionId || !lastTurnId) return;
+      if ([...pendingForksRef.current.values()].some((pending) => pending.sourceThreadId === threadId
+          && pending.lastTurnId === lastTurnId)) return;
+
+      const requestId = createCodexForkRequestId();
+      const timeoutId = setTimeout(() => {
+        finishRequest(requestId);
+        addToast(t('chat.codexFork.failed', { error: t('chat.codexFork.timeout') }), 'error');
+      }, CODEX_FORK_PENDING_TIMEOUT_MS);
+      pendingForksRef.current.set(requestId, {
+        sourceThreadId: threadId, lastTurnId, sourceMessages: scope.messages, timeoutId,
+      });
+
+      const payload = {
+        requestId,
+        action: 'fork',
+        threadId,
+        params: { threadId, lastTurnId },
+      };
+      if (!sendBridgeEvent('codex_queue_action', JSON.stringify(payload))) {
+        finishRequest(requestId);
+        addToast(t('chat.codexFork.failed', { error: t('chat.codexFork.unavailable') }), 'error');
+      }
+    };
+
+    const onQueueResult = (event: Event) => {
+      const detail = (event as CustomEvent<{
+        requestId?: string;
+        success?: boolean;
+        result?: unknown;
+        error?: unknown;
+      }>).detail;
+      if (!detail?.requestId || !pendingForksRef.current.has(detail.requestId)) return;
+      const pending = pendingForksRef.current.get(detail.requestId)!;
+      const threadId = forkResultThreadId(detail.result);
+      const scope = forkSessionScopeRef.current;
+      const succeeded = detail.success === true && !detail.error && Boolean(threadId);
+      if (!succeeded) {
+        finishRequest(detail.requestId);
+        const error = forkErrorMessage(detail.error) ?? t('chat.codexFork.noThreadId');
+        addToast(t('chat.codexFork.failed', { error }), 'error');
+        return;
+      }
+      if (scope.currentProvider !== 'codex' || scope.currentSessionId !== pending.sourceThreadId) {
+        finishRequest(detail.requestId);
+        return;
+      }
+      finishRequest(detail.requestId);
+      if (scope.loading || scope.messages !== pending.sourceMessages) {
+        addToast(t('chat.codexFork.createdInHistory'), 'info');
+        return;
+      }
+      scope.loadHistorySession(threadId!, 'codex');
+    };
+
+    const onRuntimeEvent = (event: Event) => {
+      const detail = (event as CustomEvent<{
+        kind?: string;
+        threadId?: string | null;
+        rootThreadId?: string | null;
+        turnId?: string | null;
+        payload?: Record<string, unknown>;
+      }>).detail;
+      if (detail?.kind !== 'operationDone') return;
+      const scope = forkSessionScopeRef.current;
+      const eventThreadId = detail.rootThreadId ?? detail.threadId;
+      const turnId = detail.turnId;
+      const status = detail.payload?.outcome;
+      if (scope.currentProvider !== 'codex' || !scope.currentSessionId
+          || eventThreadId !== scope.currentSessionId || !turnId
+          || !['completed', 'failed', 'interrupted'].includes(String(status))) return;
+
+      setMessages((previous) => previous.map((message) => {
+        const raw = record(message.raw);
+        if (message.type !== 'assistant' || !raw || raw.codexThreadId !== eventThreadId || raw.codexTurnId !== turnId) {
+          return message;
+        }
+        return { ...message, raw: { ...raw, codexTurnStatus: status } };
+      }));
+    };
+
+    window.addEventListener('codex-fork-message', onForkMessage);
+    window.addEventListener('codex-queue-result', onQueueResult);
+    window.addEventListener('codex-runtime-event', onRuntimeEvent);
+    return () => {
+      window.removeEventListener('codex-fork-message', onForkMessage);
+      window.removeEventListener('codex-queue-result', onQueueResult);
+      window.removeEventListener('codex-runtime-event', onRuntimeEvent);
+      for (const [requestId, pending] of pendingForksRef.current) {
+        clearTimeout(pending.timeoutId);
+        pendingForksRef.current.delete(requestId);
+      }
+    };
+  }, [addToast, setMessages, t]);
 
   // Delete history session
   const deleteHistorySession = useCallback((sessionId: string) => {

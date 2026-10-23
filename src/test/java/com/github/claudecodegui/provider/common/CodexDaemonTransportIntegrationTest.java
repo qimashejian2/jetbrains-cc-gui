@@ -44,23 +44,86 @@ public class CodexDaemonTransportIntegrationTest {
         this.exercise("native-read-only", false);
     }
 
+    @Test
+    public void nativeQueueSteerAndForkCommandsBypassThePendingSend() throws Exception {
+        Path repository = Path.of(System.getProperty("user.dir")).toAbsolutePath();
+        Path home = this.folder.newFolder("native-controls-home").toPath();
+        Path cwd = this.folder.newFolder("native-controls-workspace").toPath();
+        Path trace = home.resolve("peer-trace.ndjson");
+        AtomicReference<Process> process = new AtomicReference<>();
+        CodexFixtureDaemon daemon = new CodexFixtureDaemon(repository, home, "never-respond", trace, process);
+        List<JsonObject> events = new CopyOnWriteArrayList<>();
+        daemon.addEventListener((kind, data) -> {
+            if ("codex_event".equals(kind)) events.add(data.deepCopy());
+        });
+        try {
+            assertTrue(daemon.start());
+            JsonObject sendParams = new JsonObject();
+            sendParams.addProperty("channelId", "native-control-test");
+            sendParams.addProperty("sessionEpoch", "test-epoch");
+            sendParams.addProperty("cwd", cwd.toString());
+            sendParams.addProperty("message", "keep this turn pending");
+            sendParams.addProperty("clientMessageId", "fixture-client-id");
+            var send = daemon.sendCommand("codex.send", sendParams, new Sink());
+            JsonObject turnStarted = awaitEvent(events, "turnStarted");
+            String threadId = turnStarted.get("threadId").getAsString();
+
+            JsonObject base = new JsonObject();
+            base.addProperty("channelId", "native-control-test");
+            base.addProperty("sessionEpoch", "test-epoch");
+            base.addProperty("cwd", cwd.toString());
+            base.addProperty("threadId", threadId);
+            JsonArray input = new JsonArray();
+            JsonObject text = new JsonObject();
+            text.addProperty("type", "text");
+            text.addProperty("text", "queued or steered text");
+            input.add(text);
+
+            List<NativeCommand> commands = List.of(
+                    new NativeCommand("codex.steer", with(base, "input", input)),
+                    new NativeCommand("codex.queueAdd", with(base, "input", input, "clientUserMessageId", "request-add-1")),
+                    new NativeCommand("codex.queueList", base),
+                    new NativeCommand("codex.queueUpdate", with(base, "input", input, "queuedSubmissionId", "queued-1")),
+                    new NativeCommand("codex.queueDelete", with(base, "queuedSubmissionId", "queued-1")),
+                    new NativeCommand("codex.queueReorder", with(base, "queuedSubmissionIds", JsonParser.parseString("[\"queued-1\"]").getAsJsonArray())),
+                    new NativeCommand("codex.queueStart", base),
+                    new NativeCommand("codex.fork", with(base, "lastTurnId", "turn-test-0001")));
+            for (NativeCommand command : commands) {
+                this.assertNativeRejection(daemon, command);
+                assertFalse("native control must finish before the turn it targets", send.isDone());
+            }
+
+            List<JsonObject> wire = Files.readAllLines(trace).stream().filter(line -> !line.isBlank())
+                    .map(JsonParser::parseString).map(element -> element.getAsJsonObject()).toList();
+            assertTrue(wire.stream().filter(event -> "client_message".equals(event.get("kind").getAsString()))
+                    .map(event -> event.get("method").getAsString()).toList().containsAll(List.of(
+                            "turn/steer", "thread/queue/add", "thread/queue/list", "thread/queue/update",
+                            "thread/queue/delete", "thread/queue/reorder", "thread/queue/start", "thread/fork")));
+
+            JsonObject stop = new JsonObject();
+            stop.addProperty("channelId", "native-control-test");
+            stop.addProperty("sessionEpoch", "test-epoch");
+            assertTrue(daemon.sendCommand("codex.abortTurn", stop, new Sink()).get(10, TimeUnit.SECONDS));
+            assertFalse(send.get(10, TimeUnit.SECONDS));
+        } finally {
+            Process child = process.get();
+            List<ProcessHandle> descendants = child == null ? List.of() : child.descendants().toList();
+            daemon.stop();
+            if (child != null) assertTrue(child.waitFor(10, TimeUnit.SECONDS));
+            for (ProcessHandle descendant : descendants) {
+                descendant.onExit().get(10, TimeUnit.SECONDS);
+                assertFalse(descendant.isAlive());
+            }
+        }
+    }
+
     private void exercise(String scenario, boolean disconnect) throws Exception {
         Path repository = Path.of(System.getProperty("user.dir")).toAbsolutePath();
         Path home = this.folder.newFolder("home").toPath();
         Path cwd = this.folder.newFolder("workspace").toPath();
         Path trace = home.resolve("peer-trace.ndjson");
-        Path peer = repository.resolve("ai-bridge/services/codex/testing/codex-stdio-peer.js");
         AtomicReference<Process> process = new AtomicReference<>();
-        DaemonBridge daemon = new DaemonBridge(null, null, null, DaemonBridge.TimeSource.system(), () -> {
-            ProcessBuilder builder = new ProcessBuilder("node", repository.resolve("ai-bridge/daemon.js").toString());
-            builder.directory(repository.resolve("ai-bridge").toFile());
-            builder.environment().put("HOME", home.toString());
-            builder.environment().put("USERPROFILE", home.toString());
-            builder.environment().put("CODEX_HOME", home.resolve("codex").toString());
-            Process child = builder.start();
-            process.set(child);
-            return child;
-        }, null);
+        CodexFixtureDaemon daemon = new CodexFixtureDaemon(repository, home, scenario, trace, process);
         List<JsonObject> events = new CopyOnWriteArrayList<>();
         daemon.addEventListener((kind, data) -> {
             if ("codex_event".equals(kind)) {
@@ -75,11 +138,6 @@ public class CodexDaemonTransportIntegrationTest {
             params.addProperty("cwd", cwd.toString());
             params.addProperty("message", "fixture prompt");
             params.addProperty("clientMessageId", "fixture-client-id");
-            JsonArray command = new JsonArray();
-            for (String argument : List.of("node", peer.toString(), "--scenario", scenario, "--trace", trace.toString())) {
-                command.add(argument);
-            }
-            params.add("codexCommandPrefix", command);
             if ("native-read-only".equals(scenario)) {
                 params.addProperty("threadId", "th-test-root-0001");
                 Sink sink = new Sink();
@@ -168,6 +226,48 @@ public class CodexDaemonTransportIntegrationTest {
             }
         }
     }
+
+    private void assertNativeRejection(CodexFixtureDaemon daemon, NativeCommand command) throws Exception {
+        Sink sink = new Sink();
+        var future = daemon.sendCommand(command.method(), command.params(), sink);
+        assertThrows(java.util.concurrent.ExecutionException.class, () -> future.get(10, TimeUnit.SECONDS));
+        JsonObject response = sink.result.get();
+        assertTrue(command.method() + " returns a structured response", response != null);
+        assertEquals(command.method(), false, response.get("success").getAsBoolean());
+        assertEquals("UNSUPPORTED", response.get("code").getAsString());
+        assertTrue(response.get("error").getAsString().contains("does not support"));
+    }
+
+    private static JsonObject awaitEvent(List<JsonObject> events, String kind) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(15);
+        while (System.nanoTime() < deadline) {
+            JsonObject found = events.stream().filter(event -> kind.equals(event.get("kind").getAsString()))
+                    .findFirst().orElse(null);
+            if (found != null) return found;
+            Thread.sleep(20);
+        }
+        throw new AssertionError("missing Codex event: " + kind);
+    }
+
+    private static JsonObject with(JsonObject source, String name, JsonArray value) {
+        JsonObject copy = source.deepCopy();
+        copy.add(name, value.deepCopy());
+        return copy;
+    }
+
+    private static JsonObject with(JsonObject source, String name, JsonArray value, String secondName, String secondValue) {
+        JsonObject copy = with(source, name, value);
+        copy.addProperty(secondName, secondValue);
+        return copy;
+    }
+
+    private static JsonObject with(JsonObject source, String name, String value) {
+        JsonObject copy = source.deepCopy();
+        copy.addProperty(name, value);
+        return copy;
+    }
+
+    private record NativeCommand(String method, JsonObject params) { }
 
     private static final class Sink implements DaemonBridge.DaemonOutputCallback {
         private final AtomicReference<JsonObject> result = new AtomicReference<>();

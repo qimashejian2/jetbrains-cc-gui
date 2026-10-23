@@ -1,5 +1,6 @@
 import { useCallback, useMemo, useState, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
+import { ArrowUp, Sparkles, Square } from 'lucide-react';
 import type { ButtonAreaProps, CodexFastMode, ModelInfo, PermissionMode, ReasoningEffort } from './types';
 import { DEFAULT_CLAUDE_MODEL_ID } from './types';
 import { ConfigSelect, ModeSelect, ModelConfigSelect, ProviderSelect } from './selectors';
@@ -74,6 +75,7 @@ export const ButtonArea = ({
   onLongContextChange,
 }: ButtonAreaProps) => {
   const { t } = useTranslation();
+  const isCodex = currentProvider === 'codex';
   // const fileInputRef = useRef<HTMLInputElement>(null);
   const { cliModels, cliModelsLoading, cliModelsError, cliDefaultModel, cliCatalogHasEntries, cliModelsReplaceBuiltIns, cliModelsLoaded, refreshCliModels } = useCliModels(currentProvider);
   // Dynamic omp roles (static smol/slow/plan fallback until loaded).
@@ -325,7 +327,9 @@ export const ButtonArea = ({
           data-tooltip={`${t('promptEnhancer.tooltip')} (${t('promptEnhancer.shortcut')})`}
           aria-label={t('promptEnhancer.tooltip')}
         >
-          <span className={`codicon ${isEnhancing ? 'codicon-loading codicon-modifier-spin' : 'codicon-sparkle'}`} />
+          {isCodex
+            ? isEnhancing ? <span className="codex-lucide-spinner" aria-hidden="true" /> : <Sparkles aria-hidden="true" />
+            : <span className={`codicon ${isEnhancing ? 'codicon-loading codicon-modifier-spin' : 'codicon-sparkle'}`} />}
         </button>
 
         {/* Send/Stop button */}
@@ -335,7 +339,7 @@ export const ButtonArea = ({
             onClick={handleStopClick}
             title={t('chat.stopGeneration')}
           >
-            <span className="codicon codicon-debug-stop" />
+            {isCodex ? <Square aria-hidden="true" /> : <span className="codicon codicon-debug-stop" />}
           </button>
         ) : (
           <button
@@ -344,7 +348,7 @@ export const ButtonArea = ({
             disabled={disabled || !hasInputContent}
             title={t('chat.sendMessageEnter')}
           >
-            <span className="codicon codicon-send" />
+            {isCodex ? <ArrowUp aria-hidden="true" /> : <span className="codicon codicon-send" />}
           </button>
         )}
       </div>

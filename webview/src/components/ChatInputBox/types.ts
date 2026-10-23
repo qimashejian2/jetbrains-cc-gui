@@ -810,6 +810,8 @@ export type CodexFastMode = 'normal' | 'fast';
 /** Which key combination sends the message: plain Enter, or Cmd/Ctrl+Enter. */
 export type SendShortcut = 'enter' | 'cmdEnter';
 
+export type CodexFollowUpMode = 'queue' | 'steer';
+
 /**
  * Reasoning level information
  */
@@ -944,7 +946,7 @@ export interface ChatInputBoxProps {
 
   // Event callbacks
   /** Submit message */
-  onSubmit?: (content: string, attachments?: Attachment[]) => void;
+  onSubmit?: (content: string, attachments?: Attachment[], followUpMode?: CodexFollowUpMode) => void | boolean | Promise<boolean | void>;
   /** Stop generation */
   onStop?: () => void;
   /** Input change */
@@ -1025,6 +1027,19 @@ export interface ChatInputBoxProps {
   onRemoveFromQueue?: (id: string) => void;
   /** Reorder message queue callback (orderedIds[0] executes first) */
   onReorderQueue?: (orderedIds: string[]) => void;
+  /** Native Codex queue actions. */
+  onUpdateQueueItem?: (id: string, content: string) => Promise<boolean>;
+  onSteerQueueItem?: (id: string) => void;
+  onResumeQueue?: () => void;
+  queuePaused?: boolean;
+  queueTurnActive?: boolean;
+  steeringQueueIds?: ReadonlySet<string>;
+  retryableSteeringQueueIds?: ReadonlySet<string>;
+  queueError?: string | null;
+  codexFollowUpMode?: CodexFollowUpMode;
+  onCodexFollowUpModeChange?: (mode: CodexFollowUpMode) => void;
+  /** Keep the draft until a native queue add is acknowledged. */
+  preserveInputUntilSubmitAccepted?: boolean;
 
   /** Whether auto open file is enabled */
   autoOpenFileEnabled?: boolean;
@@ -1182,4 +1197,11 @@ export interface QueuedMessage {
   attachments?: Attachment[];
   /** Timestamp when queued */
   queuedAt: number;
+  /** Native App Server fields, present only for Codex queue entries. */
+  queuedSubmissionId?: string;
+  input?: Array<Record<string, unknown>>;
+  /** Queue origin when local and native Codex entries share one display. */
+  source?: 'local' | 'native';
+  /** Original id used by the queue source's actions and status sets. */
+  sourceId?: string;
 }

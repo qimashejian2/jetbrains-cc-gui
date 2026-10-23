@@ -6,9 +6,12 @@ import com.github.claudecodegui.provider.codex.CodexSDKBridge;
 import com.github.claudecodegui.provider.common.MessageCallback;
 import com.github.claudecodegui.session.ClaudeSession;
 import com.google.gson.Gson;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import com.intellij.openapi.diagnostic.Logger;
 
+import java.util.concurrent.CompletableFuture;
 import java.util.Set;
 
 /**
@@ -34,6 +37,7 @@ public class CodexInteractionHandler extends BaseMessageHandler {
             "execute_codex_plan",
             "codex_compact",
             "codex_review",
+            "codex_queue_action",
             "codex_preconnect",
             "codex_release_thread"
     };
@@ -88,11 +92,138 @@ public class CodexInteractionHandler extends BaseMessageHandler {
             handleLongOperation(type, content);
             return true;
         }
+        if ("codex_queue_action".equals(type)) {
+            return handleQueueInteraction(content);
+        }
         if ("codex_preconnect".equals(type) || "codex_release_thread".equals(type)) {
             handleLifecycleOperation(type, content);
             return true;
         }
         return false;
+    }
+
+    private boolean handleQueueInteraction(String content) {
+        JsonObject payload = parseObject(content);
+        if (payload == null) {
+            publishQueueResult(null, queueError("Invalid Codex queue request", "INVALID_PARAMS"), null);
+            return true;
+        }
+        String action = stringValue(payload, "action");
+        if (!"steer".equals(action) && !"fork".equals(action)) {
+            return false;
+        }
+        JsonElement requestId = payload.get("requestId");
+        if (!hasStableRequestId(requestId)) {
+            publishQueueResult(requestId, queueError("Codex interaction requires a stable requestId", "INVALID_PARAMS"), null);
+            return true;
+        }
+        ClaudeSession session = this.context.getSession();
+        String channelId = nonEmpty(stringValue(payload, "channelId"),
+                session == null ? null : session.getChannelId());
+        String cwd = nonEmpty(stringValue(payload, "cwd"), session == null ? null : session.getCwd());
+        String threadId = nonEmpty(stringValue(payload, "threadId"),
+                session == null ? null : session.getSessionId());
+        if (session != null && !java.util.Objects.equals(threadId, session.getSessionId())) {
+            publishQueueResult(requestId, queueError(
+                    "Requested Codex thread is no longer selected", "STALE_SESSION"), null);
+            return true;
+        }
+        String turnId = stringValue(payload, "turnId");
+        CodexSDKBridge bridge = this.context.getCodexSDKBridge();
+        if (bridge == null) {
+            publishQueueResult(requestId, queueError("Codex bridge is unavailable", "BRIDGE_UNAVAILABLE"), null);
+            return true;
+        }
+        String expectedEpoch = bridge.captureRuntimeSessionEpoch(channelId);
+        if (expectedEpoch == null) {
+            publishQueueResult(requestId, queueError(
+                    "Codex session changed before queue interaction", "STALE_SESSION"), null);
+            return true;
+        }
+        JsonObject params = payload.has("params") && payload.get("params").isJsonObject()
+                ? payload.getAsJsonObject("params").deepCopy() : payload.deepCopy();
+        if (!payload.has("params") || !payload.get("params").isJsonObject()) {
+            for (String key : new String[]{"action", "requestId", "channelId", "cwd", "threadId", "turnId"}) {
+                params.remove(key);
+            }
+        }
+        if ("steer".equals(action)
+                && (threadId == null || threadId.isBlank() || turnId == null || turnId.isBlank()
+                || !params.has("input") || !params.get("input").isJsonArray())) {
+            publishQueueResult(requestId, queueError("Steer requires threadId, turnId, and input", "INVALID_PARAMS"), null);
+            return true;
+        }
+        String lastTurnId = stringValue(params, "lastTurnId");
+        if ("fork".equals(action) && (threadId == null || threadId.isBlank()
+                || lastTurnId == null || lastTurnId.isBlank())) {
+            publishQueueResult(requestId, queueError("Fork requires threadId and lastTurnId", "INVALID_PARAMS"), null);
+            return true;
+        }
+        String forkBoundary = lastTurnId;
+        CompletableFuture<JsonObject> request = CompletableFuture
+                .supplyAsync(() -> "steer".equals(action)
+                                ? CompletableFuture.completedFuture(bridge.steerCodexTurn(
+                                        channelId, cwd, threadId, turnId, params.getAsJsonArray("input"), expectedEpoch))
+                                : bridge.forkCodexThread(channelId, cwd, threadId, forkBoundary, expectedEpoch),
+                        CodexSDKBridge.codexControlExecutor())
+                .thenCompose(future -> future);
+        request.whenComplete((result, failure) -> publishQueueResult(requestId, result, failure));
+        return true;
+    }
+
+    private void publishQueueResult(JsonElement requestId, JsonObject response, Throwable failure) {
+        JsonObject event = new JsonObject();
+        event.add("requestId", requestId == null ? JsonNull.INSTANCE : requestId.deepCopy());
+        if (failure != null) {
+            Throwable cause = unwrap(failure);
+            event.addProperty("error", cause.getMessage() == null ? "Codex queue request failed" : cause.getMessage());
+            event.addProperty("code", "DAEMON_ERROR");
+            event.addProperty("success", false);
+        } else if (response == null) {
+            event.addProperty("error", "Codex queue request returned no result");
+            event.addProperty("code", "DAEMON_ERROR");
+            event.addProperty("success", false);
+        } else {
+            if (response.has("result")) {
+                event.add("result", response.get("result").deepCopy());
+            }
+            if (response.has("error")) {
+                event.add("error", response.get("error").deepCopy());
+            }
+            if (response.has("code")) {
+                event.add("code", response.get("code").deepCopy());
+            }
+            event.addProperty("success", !response.has("success") || response.get("success").getAsBoolean());
+            if (!event.has("result") && !event.has("error")) {
+                event.add("result", response.deepCopy());
+            }
+        }
+        String json = GSON.toJson(event);
+        String script = "window.dispatchEvent(new CustomEvent('codex-queue-result', {detail: JSON.parse('"
+                + escapeJs(json) + "')}));";
+        executeJavaScript(script);
+    }
+
+    private static JsonObject queueError(String message, String code) {
+        JsonObject result = new JsonObject();
+        result.addProperty("error", message);
+        result.addProperty("code", code);
+        result.addProperty("success", false);
+        return result;
+    }
+
+    private static boolean hasStableRequestId(JsonElement requestId) {
+        return requestId != null && requestId.isJsonPrimitive()
+                && requestId.getAsJsonPrimitive().isString() && !requestId.getAsString().isBlank();
+    }
+
+    private static Throwable unwrap(Throwable failure) {
+        Throwable cause = failure;
+        while ((cause instanceof java.util.concurrent.CompletionException
+                || cause instanceof java.util.concurrent.ExecutionException) && cause.getCause() != null) {
+            cause = cause.getCause();
+        }
+        return cause;
     }
 
     private void handleDeliveryAcknowledgement(String content) {
@@ -196,11 +327,17 @@ public class CodexInteractionHandler extends BaseMessageHandler {
                 session == null ? null : session.getCwd());
         CodexSDKBridge bridge = this.context.getCodexSDKBridge();
         if (bridge != null) {
+            String expectedEpoch = bridge.captureRuntimeSessionEpoch(channelId);
+            if (expectedEpoch == null) {
+                notifyResult(staleSessionError(), null);
+                return;
+            }
             // Blocking daemon round-trips (up to ~40s incl. daemon cold start)
             // must never run on the JCEF UI thread that serializes all
             // webview→Java messages.
             java.util.concurrent.CompletableFuture
-                    .supplyAsync(() -> bridge.abortCodexTurn(channelId, cwd), CodexSDKBridge.codexControlExecutor())
+                    .supplyAsync(() -> bridge.abortCodexTurn(channelId, cwd, expectedEpoch),
+                            CodexSDKBridge.codexControlExecutor())
                     .thenAccept(acknowledgement -> this.notifyResult(acknowledgement, null));
         }
     }
@@ -217,8 +354,14 @@ public class CodexInteractionHandler extends BaseMessageHandler {
                 ? payload.getAsJsonObject("settings") : new JsonObject();
         CodexSDKBridge bridge = this.context.getCodexSDKBridge();
         if (bridge != null) {
+            String expectedEpoch = bridge.captureRuntimeSessionEpoch(channelId);
+            if (expectedEpoch == null) {
+                notifyResult(staleSessionError(), null);
+                return;
+            }
             java.util.concurrent.CompletableFuture
-                    .supplyAsync(() -> bridge.updateCodexSettings(channelId, cwd, settings), CodexSDKBridge.codexControlExecutor())
+                    .supplyAsync(() -> bridge.updateCodexSettings(channelId, cwd, settings, expectedEpoch),
+                            CodexSDKBridge.codexControlExecutor())
                     .thenAccept(acknowledgement -> this.notifyResult(acknowledgement, null));
         }
     }
@@ -259,14 +402,26 @@ public class CodexInteractionHandler extends BaseMessageHandler {
             notifyResult(errorResult("Codex bridge is unavailable"), null);
             return;
         }
+        String expectedEpoch = bridge.captureRuntimeSessionEpoch(channelId);
+        if (expectedEpoch == null) {
+            notifyResult(staleSessionError(), null);
+            return;
+        }
         java.util.concurrent.CompletableFuture
-                .supplyAsync(() -> bridge.updateCodexSettings(channelId, cwd, settings), CodexSDKBridge.codexControlExecutor())
+                .supplyAsync(() -> bridge.updateCodexSettings(channelId, cwd, settings, expectedEpoch),
+                        CodexSDKBridge.codexControlExecutor())
                 .thenAccept(acknowledgement -> this.notifyResult(acknowledgement, null));
     }
 
     private static JsonObject errorResult(String message) {
         JsonObject result = new JsonObject();
         result.addProperty("error", message);
+        return result;
+    }
+
+    private static JsonObject staleSessionError() {
+        JsonObject result = errorResult("Codex session changed before operation");
+        result.addProperty("code", "STALE_SESSION");
         return result;
     }
 
@@ -279,6 +434,10 @@ public class CodexInteractionHandler extends BaseMessageHandler {
         String threadId = nonEmpty(stringValue(payload, "threadId"),
                 session == null ? null : session.getSessionId());
         String requestId = stringValue(payload, "requestId");
+        if (session != null && !java.util.Objects.equals(threadId, session.getSessionId())) {
+            this.notifyOperationResult(staleSessionError(), "execute_codex_plan", threadId, requestId);
+            return;
+        }
         CodexSDKBridge bridge = this.context.getCodexSDKBridge();
         if (bridge == null) {
             this.notifyOperationResult(errorResult("Codex bridge is unavailable"), "execute_codex_plan", threadId, requestId);
@@ -292,10 +451,16 @@ public class CodexInteractionHandler extends BaseMessageHandler {
                     "execute_codex_plan", threadId, requestId);
             return;
         }
+        String expectedEpoch = bridge.captureRuntimeSessionEpoch(channelId);
+        if (expectedEpoch == null) {
+            this.notifyOperationResult(staleSessionError(), "execute_codex_plan", threadId, requestId);
+            return;
+        }
         // The synchronous prologue of executeCodexPlan may cold-start the daemon
         // (up to ~40s); that must never run on the JCEF message-dispatch thread.
         java.util.concurrent.CompletableFuture
-                .supplyAsync(() -> bridge.executeCodexPlan(channelId, cwd, threadId, planItemId, planText),
+                .supplyAsync(() -> bridge.executeCodexPlan(
+                                channelId, cwd, threadId, planItemId, planText, expectedEpoch),
                         CodexSDKBridge.codexControlExecutor())
                 .thenCompose(operation -> operation)
                 .whenComplete((result, failure) -> {
@@ -325,6 +490,11 @@ public class CodexInteractionHandler extends BaseMessageHandler {
             this.notifyOperationResult(errorResult("Codex bridge is unavailable"), type, threadId, requestId);
             return;
         }
+        String expectedEpoch = bridge.captureRuntimeSessionEpoch(channelId);
+        if (expectedEpoch == null) {
+            this.notifyOperationResult(staleSessionError(), type, threadId, requestId);
+            return;
+        }
         MessageCallback callback;
         Object controlTurnOwner;
         if (session != null) {
@@ -352,8 +522,8 @@ public class CodexInteractionHandler extends BaseMessageHandler {
         // prologue off the message-dispatch thread.
         java.util.concurrent.CompletableFuture
                 .supplyAsync(() -> "codex_compact".equals(type)
-                        ? bridge.compactCodex(channelId, cwd, threadId, callback)
-                        : bridge.reviewCodex(channelId, cwd, threadId, callback),
+                        ? bridge.compactCodex(channelId, cwd, threadId, callback, expectedEpoch)
+                        : bridge.reviewCodex(channelId, cwd, threadId, callback, expectedEpoch),
                         CodexSDKBridge.codexControlExecutor())
                 .thenCompose(operation -> operation)
                 .whenComplete((result, error) -> {
@@ -387,17 +557,26 @@ public class CodexInteractionHandler extends BaseMessageHandler {
                 session == null ? null : session.getCwd());
         String threadId = nonEmpty(payload == null ? null : stringValue(payload, "threadId"),
                 session == null ? null : session.getSessionId());
+        if (session != null && !java.util.Objects.equals(threadId, session.getSessionId())) {
+            notifyResult(staleSessionError(), null);
+            return;
+        }
         CodexSDKBridge bridge = this.context.getCodexSDKBridge();
         if (bridge == null) {
             notifyResult(errorResult("Codex bridge is unavailable"), null);
+            return;
+        }
+        String expectedEpoch = bridge.captureRuntimeSessionEpoch(channelId);
+        if (expectedEpoch == null) {
+            notifyResult(staleSessionError(), null);
             return;
         }
         // Same JCEF-thread rule as handleExecutePlan: keep the daemon round-trip
         // prologue off the message-dispatch thread.
         java.util.concurrent.CompletableFuture
                 .supplyAsync(() -> "codex_preconnect".equals(type)
-                        ? bridge.preconnectCodex(channelId, cwd, threadId)
-                        : bridge.releaseCodexThread(channelId, cwd, threadId),
+                        ? bridge.preconnectCodex(channelId, cwd, threadId, expectedEpoch)
+                        : bridge.releaseCodexThread(channelId, cwd, threadId, expectedEpoch),
                         CodexSDKBridge.codexControlExecutor())
                 .thenCompose(operation -> operation)
                 .whenComplete((result, error) -> {
@@ -436,7 +615,7 @@ public class CodexInteractionHandler extends BaseMessageHandler {
     }
 
     private static String stringValue(JsonObject object, String name) {
-        return object != null && object.has(name) && !object.get(name).isJsonNull()
+        return object != null && object.has(name) && object.get(name).isJsonPrimitive()
                 ? object.get(name).getAsString() : null;
     }
 

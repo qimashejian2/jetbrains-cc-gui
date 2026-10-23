@@ -59,6 +59,7 @@ export const ContextBar: React.FC<ContextBarProps> = memo(({
         usedTokens={usedTokens}
         maxTokens={maxTokens}
         showUsage={showUsage}
+        currentProvider={currentProvider}
         onAddAttachment={onAddAttachment}
       />
 

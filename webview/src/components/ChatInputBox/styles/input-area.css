@@ -9,6 +9,12 @@
   overflow-y: auto;
 }
 
+.chat-input-box[data-provider="codex"] .input-editable-wrapper {
+  min-height: 44px;
+  max-height: 192px;
+  padding: 0 12px;
+}
+
 /* Code snippet tag container */
 .code-snippets-container {
   display: flex;
@@ -120,6 +126,13 @@
   line-height: 1.5;
   word-wrap: break-word;
   white-space: pre-wrap;
+}
+
+.chat-input-box[data-provider="codex"] .input-editable {
+  min-height: 44px;
+  font-family: var(--font-sans, inherit);
+  font-size: 14px;
+  line-height: 20px;
 }
 
 .input-editable:empty::before {

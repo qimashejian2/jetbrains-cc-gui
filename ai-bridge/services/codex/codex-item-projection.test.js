@@ -41,6 +41,14 @@ test('persisted string replies retain their body and native identity in live and
   }
 });
 
+test('completed turn metadata survives native message projection for message actions', () => {
+  const [message] = projectCodexItemMessages({ id: 'answer', type: 'agentMessage', text: 'Done' }, {
+    threadId: 'thread', turnId: 'turn', turnStatus: 'completed', authoritative: true,
+  });
+  assert.equal(message.codexTurnId, 'turn');
+  assert.equal(message.codexTurnStatus, 'completed');
+});
+
 test('image views pair completed snapshots with results even without a status field', () => {
   const item = { id: 'image', type: 'imageView', path: '/workspace/preview.png' };
   assert.equal(projectCodexItemMessages(item, { authoritative: false }).length, 1);
@@ -80,11 +88,11 @@ test('legacy web extensions and failed web tools retain results and terminal sta
     { authoritative: true }).length, 1);
 });
 
-test('reasoning projects object text without exposing encrypted fields', () => {
+test('reasoning projects only the public summary and excludes private content', () => {
   const messages = projectCodexItemMessages({ id: 'reasoning', type: 'reasoning',
     summary: [{ text: 'summary' }], content: [{ text: 'raw reasoning' }], encryptedContent: 'cipher' }, { threadId: 't', turnId: 'u' });
-  assert.deepEqual(messages[0].message.content.map((block) => block.thinking), ['summary', 'raw reasoning']);
-  assert.equal(JSON.stringify(messages).includes('cipher'), false);
+  assert.deepEqual(messages[0].message.content.map((block) => block.thinking), ['summary']);
+  assert.doesNotMatch(JSON.stringify(messages), /raw reasoning|cipher/);
 });
 
 test('reasoning without readable content keeps its native lifecycle and identity', () => {

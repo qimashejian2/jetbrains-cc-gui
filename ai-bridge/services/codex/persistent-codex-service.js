@@ -49,6 +49,11 @@ const sessionServices = new Map();
 const nativeHistoryCounters = new WeakMap();
 /** Services retired by a thread release: never cold-started again, only collected. */
 const retiredSessionServices = new WeakSet();
+// Explicit epochs are unique for a host lifetime. A delayed command must not
+// recreate an epoch even when release arrived before its first service did.
+const retiredSessionKeys = new Set();
+const ALL_CODEX_SOURCE_KINDS = ['cli', 'vscode', 'exec', 'appServer', 'subAgent', 'subAgentReview',
+  'subAgentCompact', 'subAgentThreadSpawn', 'subAgentOther', 'unknown'];
 
 /**
  * Pristine base environment for codex runtime construction, captured once
@@ -161,6 +166,9 @@ function resolveCliPlan(stdinData) {
  */
 function ensureSessionService(stdinData, { nativeEnvironmentDependencies = {} } = {}) {
   const sessionKey = sessionKeyOf(stdinData);
+  if (retiredSessionKeys.has(sessionKey)) {
+    throw new ClassifiedError('STALE_SESSION', 'Codex session was released');
+  }
   const existing = sessionServices.get(sessionKey);
   // Controls and catalog reads carry only routing data. Preserve the launch
   // configuration captured by send until an explicit field replaces it.
@@ -274,7 +282,7 @@ function ensureSessionService(stdinData, { nativeEnvironmentDependencies = {} } 
     startupAttempts: cliPlan.candidates.length,
     privacyIndex: new CodexPrivacyIndex({
       rootDir: join(getCodemossDir(), 'codex-privacy'),
-      scope: String(stdinData?.codexHome || process.env.CODEX_HOME || 'default'),
+      scope: String(stdinData?.codexHome || getCodexPristineBaseEnv().CODEX_HOME || 'default'),
     }),
   });
 
@@ -628,13 +636,27 @@ async function codexReadOnlyPersistent(method, stdinData = {}) {
   return await service.readOnly(method, params);
 }
 
+function nativeRequestParamsOf(stdinData = {}) {
+  const params = { ...(stdinData.params ?? {}) };
+  if (stdinData.threadId !== undefined) params.threadId = stdinData.threadId;
+  for (const key of ['input', 'clientUserMessageId', 'queuedSubmissionId', 'queuedSubmissionIds',
+    'cursor', 'limit', 'expectedTurnId', 'lastTurnId', 'beforeTurnId']) {
+    if (stdinData[key] !== undefined) params[key] = stdinData[key];
+  }
+  return params;
+}
+
+async function codexNativeRequestPersistent(method, stdinData = {}) {
+  const { service } = ensureSessionService(stdinData);
+  return await service.nativeRequest(method, nativeRequestParamsOf(stdinData));
+}
+
 export async function codexListThreadsPersistent(stdinData) {
   const projectPath = stdinData?.params?.projectPath ?? stdinData?.cwd;
   const params = {
     cwd: null,
     modelProviders: [],
-    sourceKinds: ['cli', 'vscode', 'exec', 'appServer', 'subAgent', 'subAgentReview',
-      'subAgentCompact', 'subAgentThreadSpawn', 'subAgentOther', 'unknown'],
+    sourceKinds: ALL_CODEX_SOURCE_KINDS,
     ...stdinData?.params,
   };
   delete params.projectPath;
@@ -788,6 +810,213 @@ export async function codexAbortTurnPersistent(stdinData) {
   return service.stopOperation(activeId);
 }
 
+/** VS Code parity: native thread queue, independent of the send FIFO. */
+export async function codexQueueAddPersistent(stdinData) {
+  const params = nativeRequestParamsOf(stdinData);
+  if (!params.threadId || !Array.isArray(params.input) || params.input.length === 0
+      || typeof params.clientUserMessageId !== 'string' || !params.clientUserMessageId.trim()) {
+    throw new ClassifiedError('INVALID_PARAMS', 'codex.queueAdd requires threadId, non-empty input, and clientUserMessageId');
+  }
+  return codexNativeRequestPersistent('thread/queue/add', { ...stdinData, params });
+}
+
+export async function codexQueueListPersistent(stdinData = {}) {
+  const { service } = ensureSessionService(stdinData);
+  const runtimeGeneration = service.runtimeGeneration;
+  const params = nativeRequestParamsOf(stdinData);
+  const data = [];
+  const seenCursors = new Set();
+  let cursor = params.cursor;
+  if (typeof cursor === 'string') seenCursors.add(cursor);
+
+  while (true) {
+    const pageParams = { ...params };
+    if (cursor === undefined) delete pageParams.cursor;
+    else pageParams.cursor = cursor;
+    const response = await service.nativeRequest('thread/queue/list', pageParams, {
+      expectedRuntimeGeneration: runtimeGeneration,
+    });
+    if (service.runtimeGeneration !== runtimeGeneration || service.state !== 'ready'
+        || !service.client?.alive || retiredSessionServices.has(service)) {
+      throw new ClassifiedError('RUNTIME_RESET', 'Codex runtime changed while listing the native queue', {
+        method: 'thread/queue/list',
+      });
+    }
+    if (!response || typeof response !== 'object' || Array.isArray(response)
+        || !Array.isArray(response.data)
+        || response.nextCursor !== null && typeof response.nextCursor !== 'string') {
+      throw new ClassifiedError('INVALID_RESPONSE', 'thread/queue/list returned an invalid page');
+    }
+    data.push(...response.data);
+    if (response.nextCursor === null) return { ...response, data, nextCursor: null };
+    if (seenCursors.has(response.nextCursor)) {
+      throw new ClassifiedError('INVALID_RESPONSE', 'thread/queue/list repeated a pagination cursor');
+    }
+    seenCursors.add(response.nextCursor);
+    cursor = response.nextCursor;
+  }
+}
+
+export async function codexQueueUpdatePersistent(stdinData) {
+  return codexNativeRequestPersistent('thread/queue/update', stdinData);
+}
+
+export async function codexQueueDeletePersistent(stdinData) {
+  return codexNativeRequestPersistent('thread/queue/delete', stdinData);
+}
+
+export async function codexQueueReorderPersistent(stdinData) {
+  return codexNativeRequestPersistent('thread/queue/reorder', stdinData);
+}
+
+export async function codexQueueStartPersistent(stdinData) {
+  return codexNativeRequestPersistent('thread/queue/start', stdinData);
+}
+
+/** Snapshot identities before any fork side effect; missing IDs remain quarantined. */
+async function readForkBaseline(service) {
+  const ids = new Set();
+  const generation = service.runtimeGeneration;
+  const client = service.client;
+  if (service.state !== 'ready' || !client?.alive) {
+    throw new ClassifiedError('NO_RUNTIME', 'Codex runtime must be active before preparing fork privacy');
+  }
+  for (const archived of [false, true]) {
+    let cursor = null;
+    const seen = new Set();
+    do {
+      const page = await service.readOnly('thread/list', { cwd: null, modelProviders: [],
+        sourceKinds: ALL_CODEX_SOURCE_KINDS, archived, cursor, limit: 100 });
+      if (service.retired || service.runtimeGeneration !== generation
+          || service.client !== client || !client.alive || service.state !== 'ready') {
+        throw new ClassifiedError('RUNTIME_RESET', 'Codex runtime changed while preparing fork privacy');
+      }
+      if (!Array.isArray(page?.data) || page.data.some(thread => typeof thread?.id !== 'string' || !thread.id.trim())) {
+        throw new ClassifiedError('INVALID_RESPONSE', 'Codex fork privacy requires a complete thread identity page');
+      }
+      for (const thread of page.data) ids.add(thread.id);
+      cursor = page.nextCursor ?? null;
+      if (cursor !== null && (typeof cursor !== 'string' || !cursor || seen.has(cursor))) {
+        throw new ClassifiedError('INVALID_RESPONSE', 'Codex fork privacy received an invalid or repeated cursor');
+      }
+      seen.add(cursor);
+    } while (cursor !== null);
+  }
+  return { threadIds: [...ids], runtimeGeneration: generation };
+}
+
+/** VS Code parity: fork an owned native thread and protect its retained history. */
+export async function codexForkThreadPersistent(stdinData) {
+  const params = nativeRequestParamsOf(stdinData);
+  if (typeof params.threadId !== 'string' || !params.threadId.trim()
+      || typeof params.lastTurnId !== 'string' || !params.lastTurnId.trim()) {
+    throw new ClassifiedError('INVALID_PARAMS', 'codex.fork requires threadId and lastTurnId');
+  }
+  if (params.beforeTurnId != null) {
+    throw new ClassifiedError('INVALID_PARAMS', 'codex.fork only accepts the lastTurnId boundary');
+  }
+
+  const { service } = ensureSessionService(stdinData);
+  const privacyIndex = service.privacyIndex;
+  if (!privacyIndex?.beginForkProtection || !privacyIndex?.completeForkProtection
+      || !privacyIndex?.inheritFork || !privacyIndex?.markThreadConservative) {
+    throw new ClassifiedError('PRIVACY_INDEX_UNAVAILABLE', 'Codex fork history cannot be protected');
+  }
+  await privacyIndex.migrateLegacyForkProtection();
+  const protectionRecord = await privacyIndex.beginForkProtection({ sourceThreadId: params.threadId });
+  let forkRuntimeGeneration;
+  try {
+    const baseline = await readForkBaseline(service);
+    forkRuntimeGeneration = baseline.runtimeGeneration;
+    await privacyIndex.recordForkBaseline(protectionRecord, baseline.threadIds);
+  } catch (error) {
+    await privacyIndex.completeForkProtection(protectionRecord);
+    throw error;
+  }
+  let result;
+  try {
+    result = await service.nativeRequest('thread/fork', {
+      threadId: params.threadId,
+      lastTurnId: params.lastTurnId,
+    }, { expectedRuntimeGeneration: forkRuntimeGeneration });
+  } catch (error) {
+    // A timeout or broken transport may follow a successful native fork. Leave
+    // its durable guard in place unless the request was definitively rejected.
+    if (error?.phase === 'notWritten'
+        || ['INVALID_PARAMS', 'UNSUPPORTED', 'NO_RUNTIME', 'STALE_THREAD'].includes(error?.code)
+        || error?.code === 'RPC_ERROR' && [-32601, -32602].includes(error?.rpcCode)) {
+      await privacyIndex.completeForkProtection(protectionRecord);
+    } else {
+      await privacyIndex.quarantineForkProtection(protectionRecord);
+    }
+    throw error;
+  }
+  const forkThreadId = result?.thread?.id;
+  if (typeof forkThreadId !== 'string' || !forkThreadId.trim() || forkThreadId === params.threadId) {
+    await privacyIndex.quarantineForkProtection(protectionRecord);
+    throw new ClassifiedError('INVALID_RESPONSE', 'thread/fork did not return a distinct fork thread id');
+  }
+
+  try {
+    await privacyIndex.recordForkResult(protectionRecord, forkThreadId);
+    const [source, fork] = await Promise.all([
+      service.readOnly('thread/read', { threadId: params.threadId, includeTurns: true }),
+      service.readOnly('thread/read', { threadId: forkThreadId, includeTurns: true }),
+    ]);
+    if (source?.thread?.id !== params.threadId || fork?.thread?.id !== forkThreadId) {
+      throw new Error('Native fork history returned an unexpected thread');
+    }
+    await privacyIndex.inheritFork({
+      sourceThreadId: params.threadId,
+      forkThreadId,
+      lastTurnId: params.lastTurnId,
+      sourceTurns: source.thread.turns,
+      forkTurns: fork.thread.turns,
+      protectionRecord,
+    });
+    await privacyIndex.recordCreatedThread(forkThreadId);
+  } catch (error) {
+    // The pre-fork guard survives even when both classification and this
+    // fork-specific fallback cannot be written, including across restarts.
+    try {
+      await privacyIndex.markThreadConservative(forkThreadId);
+    } catch (maskError) {
+      await privacyIndex.quarantineForkProtection(protectionRecord);
+      throw maskError;
+    }
+  }
+  await privacyIndex.completeForkProtection(protectionRecord);
+  return result;
+}
+
+/**
+ * VS Code parity: steer the active turn with mid-flight user input. Unlike
+ * abort, steer never queues: it requires a native turn in progress. It returns
+ * a typed error when the thread is idle and is never silently queued.
+ */
+export async function codexSteerPersistent(stdinData) {
+  const { service } = ensureSessionService(stdinData);
+  const params = nativeRequestParamsOf(stdinData);
+  const threadId = params.threadId ?? service.rootThreadId ?? null;
+  if (!threadId || !Array.isArray(params.input) || params.input.length === 0) {
+    throw new ClassifiedError('INVALID_PARAMS', 'codex.steer requires threadId and non-empty input');
+  }
+  const active = service.operations.get(service.activeOperationId ?? '');
+  if (!active || active.settled || !active.nativeTurnId
+      || active.runtimeGeneration !== service.runtimeGeneration) {
+    throw new ClassifiedError('NO_ACTIVE_TURN', 'There is no active native turn to steer', { threadId });
+  }
+  if (active.threadId !== threadId) {
+    throw new ClassifiedError('THREAD_MISMATCH', 'The active native turn belongs to another thread', {
+      threadId, activeThreadId: active.threadId,
+    });
+  }
+  const expectedTurnId = params.expectedTurnId ?? active.nativeTurnId;
+  return await service.nativeRequest('turn/steer', {
+    threadId, expectedTurnId, input: params.input,
+  }, { expectedRuntimeGeneration: active.runtimeGeneration });
+}
+
 /** Control operation: record desired settings (effectiveness via notification). */
 export async function codexUpdateSettingsPersistent(stdinData) {
   const { service } = ensureSessionService(stdinData);
@@ -836,6 +1065,7 @@ export async function codexUpdateSettingsPersistent(stdinData) {
 
 /** Lifecycle: release a thread and drain its relation set. */
 export async function codexReleaseThreadPersistent(stdinData) {
+  if (String(stdinData?.sessionEpoch ?? '').trim()) retiredSessionKeys.add(sessionKeyOf(stdinData));
   const service = getServiceOrNull(stdinData);
   if (!service) {
     return { released: null };
@@ -847,6 +1077,7 @@ export async function codexReleaseThreadPersistent(stdinData) {
   // bound counter would otherwise consider the retired runtime still its own.
   nativeHistoryCounters.delete(service);
   retiredSessionServices.add(service);
+  service.retired = true;
   try {
     return await service.releaseThread(stdinData?.threadId || null);
   } finally {
@@ -858,6 +1089,7 @@ export async function codexReleaseThreadPersistent(stdinData) {
 /** Lifecycle: tear the runtime down (drain, close, confirm exit). */
 export async function codexResetRuntimePersistent(stdinData) {
   const sessionKey = sessionKeyOf(stdinData);
+  if (stdinData?.dispose && String(stdinData?.sessionEpoch ?? '').trim()) retiredSessionKeys.add(sessionKey);
   const entry = sessionServices.get(sessionKey);
   if (!entry) {
     return { reset: false };
@@ -866,7 +1098,10 @@ export async function codexResetRuntimePersistent(stdinData) {
   nativeHistoryCounters.delete(entry.service);
   // A disposing reset retires the service like a release does; a plain reset
   // keeps it, and its next count legitimately cold-starts the same host.
-  if (stdinData?.dispose) retiredSessionServices.add(entry.service);
+  if (stdinData?.dispose) {
+    retiredSessionServices.add(entry.service);
+    entry.service.retired = true;
+  }
   await entry.service.resetRuntime({ reason: stdinData?.reason ?? 'requested' });
   await entry.titleTask;
   if (stdinData?.dispose) {
@@ -906,6 +1141,7 @@ export async function codexShutdownPersistentRuntimes() {
     // lose ownership before it can ask the retired service to start again.
     nativeHistoryCounters.delete(entry.service);
     retiredSessionServices.add(entry.service);
+    entry.service.retired = true;
     teardowns.push(
       Promise.all([entry.service.resetRuntime({ reason: 'shutdown' }).catch(() => {}), entry.titleTask])
     );

@@ -26,7 +26,7 @@ export function ThinkingBlock({
 }: ThinkingBlockProps) {
   if (!shouldRevealThinking(block)) return null;
   const nativeThinking = block.native === true;
-  const thinkingText = block.thinking ?? block.text;
+  const thinkingText = nativeThinking ? block.thinking : block.thinking ?? block.text;
   const thinkingContent = thinkingText ?? t('chat.noThinkingContent');
   // Native completion can arrive before the surrounding assistant turn ends.
   const isThinkingInProgress = nativeThinking

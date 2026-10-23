@@ -227,3 +227,48 @@
         transform: scale(0.92);
     }
 }
+
+/* VS Code Codex thread header proportions and Lucide icon treatment. */
+.header.codex-header {
+    min-height: 46px;
+    height: 46px;
+    padding: 0 8px 0 12px;
+    background: var(--bg-chat);
+    border-bottom-color: var(--border-primary);
+}
+
+.codex-header .header-left {
+    gap: 8px;
+}
+
+.codex-header .header-right {
+    gap: 2px;
+}
+
+.codex-header .session-title {
+    padding-left: 0;
+    font-size: 14px;
+    font-weight: 500;
+}
+
+.codex-header .icon-button {
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    color: var(--text-tertiary);
+    transition: background-color 120ms ease, color 120ms ease;
+}
+
+.codex-header .icon-button svg,
+.codex-header .back-button svg,
+.codex-header .session-title-edit-btn svg,
+.codex-header .session-title-save-btn svg,
+.codex-header .session-title-cancel-btn svg {
+    width: 16px;
+    height: 16px;
+    stroke-width: 1.75;
+}
+
+.codex-header .icon-button:hover {
+    color: var(--text-primary);
+}

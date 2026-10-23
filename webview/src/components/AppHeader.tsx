@@ -1,10 +1,12 @@
 import { useTranslation } from 'react-i18next';
 import { ChatHeader } from './ChatHeader';
+import { CODEX_SUBAGENTS_PANEL_TOGGLE_EVENT } from './StatusPanel/codexSubagentsPanelEvent';
 import { sendBridgeEvent } from '../utils/bridge';
 import { useSession } from '../contexts/SessionContext';
 import { useUIState } from '../contexts/UIStateContext';
 
 interface AppHeaderProps {
+  currentProvider: string;
   sessionTitle: string;
   onNewSession: () => void;
   onUpdateHistoryTitle: (sessionId: string, newTitle: string) => void;
@@ -15,7 +17,7 @@ interface AppHeaderProps {
  * actions, and inline title editing into ChatHeader. View/session state is
  * consumed from contexts directly (same convention as ChatScreen).
  */
-export const AppHeader = ({ sessionTitle, onNewSession, onUpdateHistoryTitle }: AppHeaderProps) => {
+export const AppHeader = ({ currentProvider, sessionTitle, onNewSession, onUpdateHistoryTitle }: AppHeaderProps) => {
   const { t } = useTranslation();
   const {
     currentView, setCurrentView,
@@ -26,6 +28,7 @@ export const AppHeader = ({ sessionTitle, onNewSession, onUpdateHistoryTitle }: 
 
   return (
     <ChatHeader
+      currentProvider={currentProvider}
       currentView={currentView}
       sessionTitle={sessionTitle}
       t={t}
@@ -39,6 +42,7 @@ export const AppHeader = ({ sessionTitle, onNewSession, onUpdateHistoryTitle }: 
         setCurrentView('settings');
       }}
       onOpenSearch={() => setSearchOpen(true)}
+      onOpenSubagents={() => window.dispatchEvent(new Event(CODEX_SUBAGENTS_PANEL_TOGGLE_EVENT))}
       titleEditable
       onTitleChange={(newTitle) => {
         setCustomSessionTitle(newTitle);

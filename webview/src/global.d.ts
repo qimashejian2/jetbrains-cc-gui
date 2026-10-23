@@ -1,6 +1,27 @@
 /**
  * Global window interface extensions for IDEA plugin communication
  */
+interface CodexQueueResultDetail {
+  requestId?: string;
+  success?: boolean;
+  result?: unknown;
+  error?: string | { message?: string };
+  code?: string;
+}
+
+interface CodexRuntimeEventDetail {
+  kind?: string;
+  threadId?: string | null;
+  rootThreadId?: string | null;
+  turnId?: string | null;
+  payload?: Record<string, unknown>;
+}
+
+interface WindowEventMap {
+  'codex-queue-result': CustomEvent<CodexQueueResultDetail>;
+  'codex-runtime-event': CustomEvent<CodexRuntimeEventDetail>;
+}
+
 interface Window {
   /**
    * Send message to Java backend

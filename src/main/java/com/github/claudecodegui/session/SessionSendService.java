@@ -131,6 +131,11 @@ public class SessionSendService {
         return turnOwner;
     }
 
+    /** Captures the bridge epoch for the channel before asynchronous context collection begins. */
+    public String captureCodexRuntimeSessionEpoch(String channelId) {
+        return codexSDKBridge == null ? null : codexSDKBridge.captureRuntimeSessionEpoch(channelId);
+    }
+
     public CompletableFuture<Void> sendMessageToProvider(
             String channelId,
             String input,
@@ -215,6 +220,30 @@ public class SessionSendService {
             String clientMessageId,
             JsonObject nativeCodexSettings
     ) {
+        String codexRuntimeEpoch = "codex".equals(state.getProvider())
+                ? captureCodexRuntimeSessionEpoch(channelId) : null;
+        return sendMessageToProvider(
+                channelId, input, attachments, openedFilesJson, externalAgentPrompt, fileTagPaths,
+                requestedPermissionMode, requestedReasoningEffort, requestedCodexFastMode,
+                requestedDshPreset, clientMessageId, nativeCodexSettings, codexRuntimeEpoch);
+    }
+
+    /** Sends a message while retaining the runtime epoch frozen at turn start. */
+    public CompletableFuture<Void> sendMessageToProvider(
+            String channelId,
+            String input,
+            List<ClaudeSession.Attachment> attachments,
+            JsonObject openedFilesJson,
+            String externalAgentPrompt,
+            List<String> fileTagPaths,
+            String requestedPermissionMode,
+            String requestedReasoningEffort,
+            String requestedCodexFastMode,
+            String requestedDshPreset,
+            String clientMessageId,
+            JsonObject nativeCodexSettings,
+            String codexRuntimeEpoch
+    ) {
         String agentPrompt = externalAgentPrompt;
         if (agentPrompt == null) {
             agentPrompt = getAgentPrompt();
@@ -257,7 +286,8 @@ public class SessionSendService {
                     normalizedRequestedEffort,
                     effectiveCodexServiceTier,
                     clientMessageId,
-                    nativeCodexSettings
+                    nativeCodexSettings,
+                    codexRuntimeEpoch
             );
         }
 
@@ -434,7 +464,8 @@ public class SessionSendService {
             String requestedReasoningEffort,
             String effectiveCodexServiceTier,
             String clientMessageId,
-            JsonObject nativeCodexSettings
+            JsonObject nativeCodexSettings,
+            String codexRuntimeEpoch
     ) {
         CodexMessageHandler handler = new CodexMessageHandler(this.state,
                 this.callbackFacade.getCallbackHandler(), clientMessageId);
@@ -469,7 +500,8 @@ public class SessionSendService {
                 effectiveCodexServiceTier,
                 handler,
                 clientMessageId,
-                nativeCodexSettings
+                nativeCodexSettings,
+                codexRuntimeEpoch
         ).thenApply(result -> null);
     }
 

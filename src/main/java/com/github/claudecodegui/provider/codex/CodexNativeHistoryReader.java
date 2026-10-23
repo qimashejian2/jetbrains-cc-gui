@@ -21,6 +21,7 @@ public final class CodexNativeHistoryReader {
     private final String channelId;
     private final String cwd;
     private final String threadId;
+    private final String expectedEpoch;
     private String readMode = "paged";
 
     /** Binds a read-only operation to the current host and persisted thread. */
@@ -29,6 +30,7 @@ public final class CodexNativeHistoryReader {
         this.channelId = channelId;
         this.cwd = cwd;
         this.threadId = threadId;
+        this.expectedEpoch = bridge.captureRuntimeSessionEpoch(channelId);
     }
 
     /** Loads a page and retains the storage capability selected on the first read. */
@@ -40,7 +42,7 @@ public final class CodexNativeHistoryReader {
         JsonObject response;
         try {
             response = this.bridge.readCodexNative("codex.readHistoryPage", this.channelId,
-                    this.cwd, this.threadId, params).get(125, TimeUnit.SECONDS);
+                    this.cwd, this.threadId, params, this.expectedEpoch).get(125, TimeUnit.SECONDS);
         } catch (java.util.concurrent.TimeoutException timeout) {
             // TimeoutException carries a null message; give the failure text the
             // offline-fallback classifier can match so a wedged app-server

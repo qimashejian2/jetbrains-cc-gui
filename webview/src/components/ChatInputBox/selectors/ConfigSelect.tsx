@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
+import { Settings2 } from 'lucide-react';
 import { agentProvider, CREATE_NEW_AGENT_ID, EMPTY_STATE_ID, type AgentItem } from '../providers/agentProvider';
 import type { SelectedAgent } from '../types';
 import {
@@ -235,7 +236,9 @@ export const ConfigSelect = ({
         style={TOGGLE_BUTTON_STYLE}
         title={t('settings.configure', 'Configure')}
       >
-        <span className="codicon codicon-settings" />
+        {currentProvider === 'codex'
+          ? <Settings2 aria-hidden="true" />
+          : <span className="codicon codicon-settings" />}
       </button>
 
       {isOpen && (

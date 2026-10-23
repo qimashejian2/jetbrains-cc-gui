@@ -85,6 +85,27 @@ function eventsOf(events, kind) {
   return events.filter((event) => event.kind === kind);
 }
 
+test('a cold history read needs explicit preconnect before its persisted native queue can be listed', async () => {
+  const { service, getPeer, dispatchCounts } = makeService();
+  try {
+    await service.readOnly('thread/read', { threadId: THREAD_ID, includeTurns: true });
+    await assert.rejects(service.nativeRequest('thread/queue/list', { threadId: THREAD_ID }),
+      error => error.code === 'STALE_THREAD');
+    const peer = getPeer();
+    const originalDispatch = peer.dispatch.bind(peer);
+    peer.dispatch = (method, params, id) => method === 'thread/queue/list'
+      ? peer.reply(id, { data: [{ id: 'saved', input: [{ type: 'text', text: 'persisted request' }] }], nextCursor: null })
+      : originalDispatch(method, params, id);
+    await service.preconnect({ threadId: THREAD_ID });
+    const queue = await service.nativeRequest('thread/queue/list', { threadId: THREAD_ID });
+    assert.equal(queue.data[0].id, 'saved');
+    assert.equal(dispatchCounts.get('thread/resume'), 1);
+    assert.equal(dispatchCounts.get('turn/start') ?? 0, 0);
+  } finally {
+    await service.resetRuntime();
+  }
+});
+
 test('restored usage cannot steal sends around a manual compaction', async () => {
   const markers = [];
   const { service, events } = makeService({ scenario: 'resume-replayed-usage',
@@ -302,42 +323,41 @@ test('empty native reasoning starts visibly and completes under the same message
   } finally { await service.resetRuntime(); }
 });
 
-test('received native reasoning survives empty updated and terminal snapshots', async (t) => {
-  for (const [field, method] of [['summary', 'item/reasoning/summaryTextDelta'], ['content', 'item/reasoning/textDelta']]) {
-    for (const status of ['completed', 'failed', 'interrupted']) {
-      await t.test(`${field} remains readable when ${status}`, async () => {
-        const markers = [];
-        const { service, getClient, getPeer } = makeService({ scenario: 'never-respond',
-          serviceOpts: { emitMarker: (_operation, marker) => markers.push(marker) } });
-        const messages = () => markers.filter(marker => String(marker).startsWith('[MESSAGE] '))
-          .map(marker => JSON.parse(marker.slice('[MESSAGE] '.length)))
-          .filter(message => message.codexItemId === 'streamed-reasoning');
-        try {
-          const send = service.send({ input: [{ type: 'text', text: 'keep the native summary' }] });
-          await waitFor(() => [...service.operations.values()][0]?.nativeTurnId);
-          const operation = [...service.operations.values()][0];
-          for (const id of getPeer().pendingAcks.keys()) getPeer().ackPending(id, { turn: { id: operation.nativeTurnId } });
-          const identity = { threadId: operation.threadId, turnId: operation.nativeTurnId };
-          const item = { id: 'streamed-reasoning', type: 'reasoning', summary: [], content: [] };
-          getClient().emit('notification', { method: 'item/started', params: { ...identity, item } });
-          for (const delta of ['原生摘要', ' 🧪']) {
-            getClient().emit('notification', { method, params: { ...identity, itemId: item.id, delta,
-              ...(field === 'summary' ? { summaryIndex: 0 } : { contentIndex: 0 }) } });
-          }
-          getClient().emit('notification', { method: 'item/updated', params: { ...identity, item } });
-          assert.equal(messages().at(-1).message.content[0].thinking, '原生摘要 🧪', 'empty updates cannot erase received text');
-          getClient().emit('notification', { method: 'item/completed', params: { ...identity, item: { ...item, status } } });
-          getClient().emit('notification', { method: 'turn/completed', params: {
-            threadId: operation.threadId, turn: { id: operation.nativeTurnId, status } } });
-          assert.equal((await send).outcome, status);
-          const completed = messages().at(-1);
-          assert.deepEqual(completed.message.content,
-            [{ type: 'thinking', thinking: '原生摘要 🧪', text: '原生摘要 🧪', native: true, status }]);
-          assert.equal(completed.uuid, messages()[0].uuid);
-          assert.equal(completed.codexAuthoritative, true);
-        } finally { await service.resetRuntime(); }
-      });
-    }
+test('public native reasoning summary survives empty updates and terminal snapshots', async () => {
+  for (const status of ['completed', 'failed', 'interrupted']) {
+    const markers = [];
+    const { service, getClient, getPeer } = makeService({ scenario: 'never-respond',
+      serviceOpts: { emitMarker: (_operation, marker) => markers.push(marker) } });
+    const messages = () => markers.filter(marker => String(marker).startsWith('[MESSAGE] '))
+      .map(marker => JSON.parse(marker.slice('[MESSAGE] '.length)))
+      .filter(message => message.codexItemId === 'streamed-reasoning');
+    try {
+      const send = service.send({ input: [{ type: 'text', text: 'keep the native summary' }] });
+      await waitFor(() => [...service.operations.values()][0]?.nativeTurnId);
+      const operation = [...service.operations.values()][0];
+      for (const id of getPeer().pendingAcks.keys()) getPeer().ackPending(id, { turn: { id: operation.nativeTurnId } });
+      const identity = { threadId: operation.threadId, turnId: operation.nativeTurnId };
+      const item = { id: 'streamed-reasoning', type: 'reasoning', summary: [], content: [] };
+      getClient().emit('notification', { method: 'item/started', params: { ...identity, item } });
+      for (const delta of ['原生摘要', ' 🧪']) {
+        getClient().emit('notification', { method: 'item/reasoning/summaryTextDelta', params: {
+          ...identity, itemId: item.id, delta, summaryIndex: 0,
+        } });
+      }
+      getClient().emit('notification', { method: 'item/updated', params: { ...identity, item } });
+      assert.equal(messages().at(-1).message.content[0].thinking, '原生摘要 🧪', 'empty updates cannot erase the public summary');
+      getClient().emit('notification', { method: 'item/completed', params: { ...identity,
+        item: { ...item, summary: [], content: ['private reasoning'], status } } });
+      getClient().emit('notification', { method: 'turn/completed', params: {
+        threadId: operation.threadId, turn: { id: operation.nativeTurnId, status } } });
+      assert.equal((await send).outcome, status);
+      const completed = messages().at(-1);
+      assert.deepEqual(completed.message.content,
+        [{ type: 'thinking', thinking: '原生摘要 🧪', text: '原生摘要 🧪', native: true, status }]);
+      assert.equal(completed.uuid, messages()[0].uuid);
+      assert.equal(completed.codexAuthoritative, true);
+      assert.doesNotMatch(JSON.stringify([...service.itemSnapshots.values(), ...markers]), /private reasoning/);
+    } finally { await service.resetRuntime(); }
   }
 });
 
@@ -360,8 +380,35 @@ test('nonempty native reasoning completion remains authoritative over streamed t
     assert.equal((await send).outcome, 'completed');
     const completed = markers.filter(marker => String(marker).startsWith('[MESSAGE] '))
       .map(marker => JSON.parse(marker.slice('[MESSAGE] '.length))).at(-1);
-    assert.deepEqual(completed.message.content.map(block => block.thinking), ['Final summary.', 'Final content.']);
+    assert.deepEqual(completed.message.content.map(block => block.thinking), ['Final summary.']);
     assert.equal(completed.codexAuthoritative, true);
+    assert.doesNotMatch(JSON.stringify([...service.itemSnapshots.values(), ...markers]), /draft content|Final content/);
+  } finally { await service.resetRuntime(); }
+});
+
+test('raw reasoning text deltas are omitted from visible events and message snapshots', async () => {
+  const markers = [];
+  const { service, getClient, getPeer, events } = makeService({ scenario: 'never-respond',
+    serviceOpts: { emitMarker: (_operation, marker) => markers.push(marker) } });
+  try {
+    const send = service.send({ input: [] });
+    await waitFor(() => [...service.operations.values()][0]?.nativeTurnId);
+    const operation = [...service.operations.values()][0];
+    for (const id of getPeer().pendingAcks.keys()) getPeer().ackPending(id, { turn: { id: operation.nativeTurnId } });
+    const identity = { threadId: operation.threadId, turnId: operation.nativeTurnId, itemId: 'hidden-reasoning' };
+    getClient().emit('notification', { method: 'item/started', params: { ...identity,
+      item: { id: identity.itemId, type: 'reasoning', summary: [], content: ['private reasoning'] } } });
+    getClient().emit('notification', { method: 'item/reasoning/textDelta', params: {
+      ...identity, delta: 'private reasoning delta' } });
+    const visibleItem = markers.filter(marker => String(marker).startsWith('[MESSAGE] '))
+      .map(marker => JSON.parse(marker.slice('[MESSAGE] '.length))).at(-1);
+    assert.equal(visibleItem.message.content[0].thinking, '');
+    assert.equal(events.at(-1).kind, 'item/reasoning/textDelta');
+    assert.deepEqual(events.at(-1).payload, { itemId: 'hidden-reasoning' });
+    assert.doesNotMatch(JSON.stringify([...service.itemSnapshots.values(), ...markers, ...events]), /private reasoning/);
+    getClient().emit('notification', { method: 'turn/completed', params: {
+      threadId: operation.threadId, turn: { id: operation.nativeTurnId, status: 'completed' } } });
+    assert.equal((await send).outcome, 'completed');
   } finally { await service.resetRuntime(); }
 });
 
@@ -2139,6 +2186,180 @@ test('read-only native catalog and history calls bypass the operation FIFO', asy
     await service.resetRuntime();
   }
 });
+
+test('native request channel is allowlisted, thread-owned, and separate from readOnly', async () => {
+  const fixture = makeService();
+  const { service, getPeer, dispatched } = fixture;
+  try {
+    await service.send({ input: [{ type: 'text', text: 'native request fixture' }] });
+    const threadId = service.rootThreadId;
+    const peer = getPeer();
+    const nativeCalls = [];
+    const dispatch = peer.dispatch.bind(peer);
+    peer.dispatch = async (method, params, id) => {
+      if (method === 'thread/queue/list') {
+        nativeCalls.push({ method, params });
+        peer.reply(id, { data: [{ id: 'queued-1', input: [{ type: 'text', text: 'queued' }] }], nextCursor: null });
+        return;
+      }
+      if (method === 'thread/queue/start') {
+        nativeCalls.push({ method, params });
+        peer.reply(id, { started: true });
+        return;
+      }
+      await dispatch(method, params, id);
+    };
+
+    const result = await service.nativeRequest('thread/queue/list', { threadId });
+    assert.deepEqual(result, { data: [{ id: 'queued-1', input: [{ type: 'text', text: 'queued' }] }], nextCursor: null });
+    assert.deepEqual(await service.nativeRequest('thread/queue/start', { threadId }), { started: true });
+    assert.deepEqual(nativeCalls, [
+      { method: 'thread/queue/list', params: { threadId } },
+      { method: 'thread/queue/start', params: { threadId } },
+    ]);
+    assert.equal(dispatched.some(call => call.method === 'thread/queue/list'), false,
+      'native RPC bypasses the read-only method path');
+    await assert.rejects(service.readOnly('thread/queue/list', { threadId }),
+      error => error.code === 'UNSUPPORTED');
+    await assert.rejects(service.readOnly('thread/queue/start', { threadId }),
+      error => error.code === 'UNSUPPORTED');
+    await assert.rejects(service.nativeRequest('thread/name/set', { threadId, name: 'not allowlisted' }),
+      error => error.code === 'UNSUPPORTED');
+    await assert.rejects(service.nativeRequest('thread/queue/add', { threadId, input: [{ type: 'text', text: 'missing id' }] }),
+      error => error.code === 'INVALID_PARAMS');
+    await assert.rejects(service.nativeRequest('thread/fork', { threadId }),
+      error => error.code === 'INVALID_PARAMS');
+    await assert.rejects(service.nativeRequest('thread/fork', { threadId, lastTurnId: 'turn-1', beforeTurnId: 'turn-2' }),
+      error => error.code === 'INVALID_PARAMS');
+    await assert.rejects(service.nativeRequest('thread/queue/list', { threadId: 'unowned-thread' }),
+      error => error.code === 'STALE_THREAD');
+    assert.equal(nativeCalls.length, 2, 'invalid or unowned requests are rejected before dispatch');
+    await assert.rejects(service.nativeRequest('turn/steer', {
+      threadId, expectedTurnId: 'no-active-turn', input: [{ type: 'text', text: 'too late' }],
+    }), error => error.code === 'NO_ACTIVE_TURN');
+  } finally {
+    await service.resetRuntime();
+  }
+});
+
+test('native queue recovery requires an already running runtime', async () => {
+  const { service } = makeService();
+  try {
+    await assert.rejects(service.nativeRequest('thread/queue/start', { threadId: THREAD_ID }),
+      error => error.code === 'NO_RUNTIME');
+    assert.equal(service.state, 'stopped');
+  } finally {
+    await service.resetRuntime();
+  }
+});
+
+test('turn/steer is bound to the active operation turn and current runtime generation', async () => {
+  const fixture = makeService({ scenario: 'never-respond' });
+  const { service, getPeer } = fixture;
+  let sending;
+  try {
+    sending = service.send({ input: [{ type: 'text', text: 'keep this turn open' }] });
+    await waitFor(() => {
+      const active = service.operations.get(service.activeOperationId);
+      return active?.nativeTurnId && active?.runtimeGeneration === service.runtimeGeneration;
+    }, 1000, 'active turn identity');
+    const active = service.operations.get(service.activeOperationId);
+    const peer = getPeer();
+    const otherThreadId = 'th-test-owned-child-0002';
+    service.threads.set(otherThreadId, {
+      threadId: otherThreadId, parentThreadId: active.threadId, rootThreadId: active.threadId,
+      state: 'idle', relationVerified: true,
+    });
+    const steerCalls = [];
+    const dispatch = peer.dispatch.bind(peer);
+    peer.dispatch = async (method, params, id) => {
+      if (method === 'turn/steer') {
+        steerCalls.push({ method, params });
+        peer.reply(id, { accepted: true });
+        return;
+      }
+      await dispatch(method, params, id);
+    };
+
+    const input = [{ type: 'text', text: 'guide the active answer' }];
+    assert.deepEqual(await service.nativeRequest('turn/steer', {
+      threadId: active.threadId, expectedTurnId: active.nativeTurnId, input,
+    }), { accepted: true });
+    await assert.rejects(service.nativeRequest('turn/steer', {
+      threadId: otherThreadId, expectedTurnId: active.nativeTurnId, input,
+    }), error => error.code === 'THREAD_MISMATCH');
+    await assert.rejects(service.nativeRequest('turn/steer', {
+      threadId: active.threadId, expectedTurnId: 'stale-turn', input,
+    }), error => error.code === 'NO_ACTIVE_TURN');
+    assert.deepEqual(steerCalls, [{ method: 'turn/steer', params: {
+      threadId: active.threadId, expectedTurnId: active.nativeTurnId, input,
+    } }]);
+
+    const pendingAcks = [...peer.pendingAcks.keys()];
+    for (const id of pendingAcks) peer.ackPending(id, { turn: { id: active.nativeTurnId } });
+    peer.notify({ method: 'turn/completed', params: {
+      threadId: active.threadId, turn: { id: active.nativeTurnId, status: 'completed' },
+    } });
+    assert.equal((await sending).outcome, 'completed');
+  } finally {
+    await service.resetRuntime();
+  }
+});
+
+test('native request rejects a result from a replaced runtime generation', async () => {
+  const fixture = makeService();
+  const { service } = fixture;
+  try {
+    await service.send({ input: [{ type: 'text', text: 'generation fixture' }] });
+    const threadId = service.rootThreadId;
+    const client = service.client;
+    const originalRequest = client.request.bind(client);
+    let releaseResponse;
+    let announceRequest;
+    const requestStarted = new Promise(resolve => { announceRequest = resolve; });
+    const delayedResponse = new Promise(resolve => { releaseResponse = resolve; });
+    client.request = (method, params, options) => method === 'thread/queue/list'
+      ? (announceRequest(), delayedResponse)
+      : originalRequest(method, params, options);
+
+    const result = service.nativeRequest('thread/queue/list', { threadId });
+    await requestStarted;
+    service.runtimeGeneration += 1;
+    releaseResponse({ data: [], nextCursor: null });
+    await assert.rejects(result, error => error.code === 'RUNTIME_RESET');
+  } finally {
+    await service.resetRuntime();
+  }
+});
+
+test('native request classifies unsupported RPCs and preserves timeout errors without retrying', async () => {
+  const fixture = makeService();
+  const { service, getPeer } = fixture;
+  try {
+    await service.send({ input: [{ type: 'text', text: 'native error fixture' }] });
+    const threadId = service.rootThreadId;
+    const peer = getPeer();
+    let calls = 0;
+    const dispatch = peer.dispatch.bind(peer);
+    peer.dispatch = async (method, params, id) => {
+      if (method === 'thread/queue/list') {
+        calls += 1;
+        if (params.timeoutFixture) return;
+        peer.replyError(id, { code: -32601, message: 'peer has no handler for thread/queue/list' });
+        return;
+      }
+      await dispatch(method, params, id);
+    };
+
+    await assert.rejects(service.nativeRequest('thread/queue/list', { threadId }), error =>
+      error.code === 'UNSUPPORTED' && error.rpcCode === -32601);
+    await assert.rejects(service.nativeRequest('thread/queue/list', { threadId, timeoutFixture: true }, { timeoutMs: 5 }), error =>
+      error.code === 'RPC_TIMEOUT' && error.method === 'thread/queue/list');
+    assert.equal(calls, 2, 'each explicit request is sent once and never auto-retried');
+  } finally {
+    await service.resetRuntime();
+  }
+});
 test('approval reason survives a request before item start and the final snapshot', async () => {
   const markers = [];
   const { service, events } = makeService({ scenario: 'reverse-approval',
@@ -2218,3 +2439,39 @@ test('deprecated compact notification does not duplicate the current canonical b
     await send;
   } finally { await service.resetRuntime(); }
 });
+
+test('VS Code parity thread-scoped notifications pass through as codex_event envelopes', async () => {
+  const { service, events } = makeService();
+  await service.send({ input: [{ type: 'text', text: 'parity fixture' }] });
+  const threadId = service.rootThreadId;
+  const parityMethods = [
+    'thread/goal/updated', 'thread/goal/cleared', 'thread/queue/changed',
+    'thread/status/changed', 'thread/attachment/updated',
+    'thread/environment/connected', 'thread/environment/disconnected',
+    'thread/archived', 'thread/unarchived', 'thread/deleted', 'thread/reverted',
+    'thread/prediction/updated', 'thread/project/updated', 'turn/moderationMetadata',
+    'item/autoApprovalReview/started', 'item/autoApprovalReview/completed',
+  ];
+  try {
+    const client = fixtureClientOf(service);
+    for (const method of parityMethods) {
+      client.emit('notification', { method, params: { threadId, turnId: 'turn-parity', marker: method } });
+    }
+    await waitFor(() => parityMethods.every(m => eventsOf(events, m).length >= 1), 1000, 'parity notifications emitted');
+    for (const method of parityMethods) {
+      const event = eventsOf(events, method).at(-1);
+      assert.equal(event.threadId, threadId, `${method} threadId passthrough`);
+      assert.equal(event.payload.marker, method, `${method} payload passthrough`);
+    }
+    // Unknown methods still surface as nativeNotification (D2), unchanged behavior.
+    client.emit('notification', { method: 'totally/unknown', params: { threadId } });
+    await waitFor(() => eventsOf(events, 'nativeNotification').length >= 1, 1000, 'unknown fallback');
+    assert.equal(eventsOf(events, 'nativeNotification').at(-1).payload.method, 'totally/unknown');
+  } finally { await service.resetRuntime(); }
+});
+
+function fixtureClientOf(service) {
+  // The harness keeps a single live client for the active runtime generation;
+  // reuse the emitter the service attached its notification listener to.
+  return service.client;
+}

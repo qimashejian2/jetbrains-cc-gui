@@ -1,4 +1,4 @@
-import { cleanup, render, renderHook, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, renderHook, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import type { ClaudeContentBlock, ClaudeMessage, ToolResultBlock } from '../../types';
 import { extractMarkdownContent } from '../../utils/copyUtils';
@@ -38,6 +38,7 @@ const t = ((key: string, opts?: Record<string, string>) => {
   const translations: Record<string, string> = {
     'markdown.copyMessage': '复制消息',
     'markdown.copySuccess': '已复制',
+    'chat.codexFork.label': '从此消息分叉聊天',
     'chat.streamingConnected': '已连接',
     'chat.totalDuration': '本次耗时',
     'chat.tokenUsage': '输入 {{input}} / 输出 {{output}}',
@@ -115,6 +116,7 @@ it('does not render a memoized historical item during 30 tail text updates', () 
 
 function renderMessageItem(message: ClaudeMessage, options: {
   detailedOutputEnabled?: boolean; currentProvider?: string; streamingActive?: boolean; isLast?: boolean;
+  currentSessionId?: string | null;
   getContentBlocks?: (message: ClaudeMessage) => ClaudeContentBlock[];
 } = {}) {
   return render(
@@ -132,9 +134,57 @@ function renderMessageItem(message: ClaudeMessage, options: {
       extractMarkdownContent={extractMarkdownContent}
       detailedOutputEnabled={options.detailedOutputEnabled}
       currentProvider={options.currentProvider}
+      currentSessionId={options.currentSessionId}
     />
   );
 }
+
+describe('MessageItem Codex fork action', () => {
+  const completedMessage: ClaudeMessage = {
+    type: 'assistant',
+    content: 'Completed reply',
+    raw: {
+      codexThreadId: 'thread-a',
+      codexTurnId: 'turn-a',
+      codexTurnStatus: 'completed',
+      message: { content: [{ type: 'text', text: 'Completed reply' }] },
+    },
+  };
+  const completedRaw = completedMessage.raw as Record<string, unknown>;
+
+  it('dispatches a fork request with the native thread and turn identity', () => {
+    const onForkRequest = vi.fn();
+    window.addEventListener('codex-fork-message', onForkRequest);
+    const { container } = renderMessageItem(completedMessage, { currentProvider: 'codex', currentSessionId: 'thread-a' });
+
+    const actionRow = container.querySelector('.codex-message .turn-action-controls');
+    expect(actionRow).not.toBeNull();
+    expect(actionRow?.querySelector('.message-fork-btn')).not.toBeNull();
+    expect(actionRow?.querySelectorAll('button')).toHaveLength(3);
+
+    fireEvent.click(screen.getByRole('button', { name: '从此消息分叉聊天' }));
+
+    expect(onForkRequest).toHaveBeenCalledTimes(1);
+    expect((onForkRequest.mock.calls[0][0] as CustomEvent).detail).toEqual({
+      threadId: 'thread-a',
+      lastTurnId: 'turn-a',
+    });
+    window.removeEventListener('codex-fork-message', onForkRequest);
+  });
+
+  it.each([
+    { name: 'a user message', message: { ...completedMessage, type: 'user' }, currentProvider: 'codex', currentSessionId: 'thread-a', streamingActive: false },
+    { name: 'another provider', message: completedMessage, currentProvider: 'claude', currentSessionId: 'thread-a', streamingActive: false },
+    { name: 'a different thread', message: completedMessage, currentProvider: 'codex', currentSessionId: 'thread-b', streamingActive: false },
+    { name: 'a missing turn id', message: { ...completedMessage, raw: { ...completedRaw, codexTurnId: '' } }, currentProvider: 'codex', currentSessionId: 'thread-a', streamingActive: false },
+    { name: 'an uncompleted turn', message: { ...completedMessage, raw: { ...completedRaw, codexTurnStatus: 'inProgress' } }, currentProvider: 'codex', currentSessionId: 'thread-a', streamingActive: false },
+    { name: 'a turn without completion metadata', message: { ...completedMessage, raw: { codexThreadId: 'thread-a', codexTurnId: 'turn-a' } }, currentProvider: 'codex', currentSessionId: 'thread-a', streamingActive: false },
+    { name: 'a streaming reply', message: completedMessage, currentProvider: 'codex', currentSessionId: 'thread-a', streamingActive: true },
+  ])('hides the fork action for $name', ({ message, currentProvider, currentSessionId, streamingActive }) => {
+    renderMessageItem(message, { currentProvider, currentSessionId, streamingActive, isLast: streamingActive });
+    expect(screen.queryByRole('button', { name: '从此消息分叉聊天' })).toBeNull();
+  });
+});
 
 describe('MessageItem native thinking visibility', () => {
   it.each([

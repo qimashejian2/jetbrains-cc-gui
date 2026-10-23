@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { readdir, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CodexAppServerService } from './codex-appserver-service.js';
+import { CodexPrivacyIndex } from './codex-privacy-index.js';
 
 // The persistent service writes process-level NDJSON via
 // process.stdout._originalStdoutWrite when present; install a capture writer
@@ -20,6 +22,9 @@ process.stdout._originalStdoutWrite = function _testWrite(chunk, encoding, callb
 
 const here = dirname(fileURLToPath(import.meta.url));
 const peerScript = resolve(here, 'testing', 'codex-stdio-peer.js');
+const testHome = mkdtempSync(join(tmpdir(), 'codex-daemon-home-'));
+const originalHome = process.env.HOME;
+process.env.HOME = testHome;
 const testCwd = mkdtempSync(join(tmpdir(), 'codex-daemon-test-'));
 
 const {
@@ -28,6 +33,14 @@ const {
   codexPreconnectPersistent,
   codexRespondInteractionPersistent,
   codexAbortTurnPersistent,
+  codexQueueAddPersistent,
+  codexQueueListPersistent,
+  codexQueueUpdatePersistent,
+  codexQueueDeletePersistent,
+  codexQueueReorderPersistent,
+  codexQueueStartPersistent,
+  codexSteerPersistent,
+  codexForkThreadPersistent,
   codexResetRuntimePersistent,
   codexReleaseThreadPersistent,
   codexShutdownPersistentRuntimes,
@@ -41,6 +54,43 @@ const {
 } = await import('./persistent-codex-service.js');
 
 setCodexPristineBaseEnv({ ...process.env, CODEX_HOME: join(testCwd, 'native-home') });
+
+test('release before a cold queue read tombstones the old epoch without touching a new epoch', async () => {
+  const old = { channelId: 'released-before-create', sessionEpoch: 'old', cwd: testCwd,
+    codexCommandPrefix: peerCommandPrefix('early-notification'), threadId: 'old-thread' };
+  const coldRead = Promise.resolve().then(() => codexQueueListPersistent(old));
+  const released = codexReleaseThreadPersistent(old);
+  await assert.rejects(coldRead, error => error.code === 'STALE_SESSION');
+  await released;
+  await assert.rejects(codexPreconnectPersistent(old), error => error.code === 'STALE_SESSION');
+  const next = { ...old, sessionEpoch: 'new', threadId: 'new-thread' };
+  await codexPreconnectPersistent(next);
+  assert.equal(getCodexRuntimeSnapshot().sessions.find(session => session.sessionKey === 'released-before-create::new')?.rootThreadId,
+    'new-thread');
+  await codexReleaseThreadPersistent(next);
+});
+
+test('disposing a missing runtime tombstones its explicit session epoch', async () => {
+  const old = { channelId: 'disposed-before-create', sessionEpoch: 'old', cwd: testCwd,
+    codexCommandPrefix: peerCommandPrefix('early-notification') };
+  assert.deepEqual(await codexResetRuntimePersistent({ ...old, dispose: true }), { reset: false });
+  await assert.rejects(codexPreconnectPersistent(old), error => error.code === 'STALE_SESSION');
+
+  const next = { ...old, sessionEpoch: 'new' };
+  await codexPreconnectPersistent(next);
+  assert.equal(getCodexRuntimeSnapshot().sessions.some(session => session.sessionKey === 'disposed-before-create::old'), false);
+  await codexReleaseThreadPersistent(next);
+});
+
+test('a preconnect already waiting on a release cannot restart the retired service', async () => {
+  const data = { channelId: 'preconnect-release-race', sessionEpoch: 'retired', cwd: testCwd,
+    codexCommandPrefix: peerCommandPrefix('early-notification'), threadId: 'old-thread' };
+  await codexPreconnectPersistent(data);
+  const releasing = codexReleaseThreadPersistent(data);
+  await assert.rejects(codexPreconnectPersistent(data), error => error.code === 'STALE_SESSION');
+  await releasing;
+  assert.equal(getCodexRuntimeSnapshot().sessions.some(session => session.sessionKey === 'preconnect-release-race::retired'), false);
+});
 
 // The webview mirrors this mapping when it derives an access scope from the
 // permission mode (deriveCodexAccessScopeFromMode). A drift here is what made a
@@ -533,6 +583,23 @@ function peerCommandPrefix(scenario) {
   return [process.execPath, peerScript, '--scenario', scenario];
 }
 
+function forkTestData(channelId) {
+  return { channelId, cwd: testCwd, codexHome: mkdtempSync(join(testHome, 'codex-home-')),
+    codexCommandPrefix: peerCommandPrefix('early-notification') };
+}
+
+async function cleanupForkProtectionRecords(index) {
+  if (!index) return;
+  let names;
+  try { names = await readdir(index.rootDir); } catch (error) {
+    if (error?.code === 'ENOENT') return;
+    throw error;
+  }
+  const forkRecords = names.filter(name => name.startsWith(index.recordPrefix)
+    && /fork-(?:pending|quarantine)\./.test(name));
+  await Promise.all(forkRecords.map(name => unlink(join(index.rootDir, name))));
+}
+
 function codexEvents() {
   return processLevelLines
     .flatMap((line) => line.split('\n'))
@@ -546,6 +613,12 @@ function codexEvents() {
 test.afterEach(async () => {
   await codexShutdownPersistentRuntimes();
   processLevelLines.length = 0;
+});
+
+test.after(() => {
+  if (originalHome === undefined) delete process.env.HOME;
+  else process.env.HOME = originalHome;
+  rmSync(testHome, { recursive: true, force: true });
 });
 
 test('codex.send reaches the native terminal and markers carry operation identity', async () => {
@@ -678,4 +751,476 @@ test('resetRuntime drains and disposes the session entry', async () => {
   });
   assert.equal(result.reset, true);
   assert.equal(getCodexRuntimeSnapshot().sessionCount, 0);
+});
+
+test('persistent native queue commands map only protocol fields and require a client message id', async () => {
+  const data = { channelId: 'native-queue-api', cwd: testCwd,
+    codexCommandPrefix: peerCommandPrefix('early-notification'), message: 'open native thread' };
+  await codexSendPersistent(data);
+  const threadId = codexEvents().find(event => event.channelId === data.channelId && event.kind === 'turnStarted').threadId;
+  const originalNativeRequest = CodexAppServerService.prototype.nativeRequest;
+  const calls = [];
+  CodexAppServerService.prototype.nativeRequest = async function (method, params, options) {
+    calls.push({ method, params, options });
+    return method === 'thread/queue/list' ? { data: [], nextCursor: null } : { accepted: true };
+  };
+  try {
+    const input = [{ type: 'text', text: 'queued input' }];
+    await codexQueueAddPersistent({ ...data, threadId, input, clientUserMessageId: 'queue-client-1' });
+    await codexQueueListPersistent({ ...data, threadId });
+    await codexQueueUpdatePersistent({ ...data, threadId, queuedSubmissionId: 'queued-1', input });
+    await codexQueueDeletePersistent({ ...data, threadId, queuedSubmissionId: 'queued-1' });
+    await codexQueueReorderPersistent({ ...data, threadId, queuedSubmissionIds: ['queued-2', 'queued-1'] });
+    await codexQueueStartPersistent({ ...data, threadId });
+    await assert.rejects(codexQueueAddPersistent({ ...data, threadId, input }),
+      error => error.code === 'INVALID_PARAMS');
+    assert.deepEqual(calls.map(({ method, params }) => ({ method, params })), [
+      { method: 'thread/queue/add', params: { threadId, input, clientUserMessageId: 'queue-client-1' } },
+      { method: 'thread/queue/list', params: { threadId } },
+      { method: 'thread/queue/update', params: { threadId, queuedSubmissionId: 'queued-1', input } },
+      { method: 'thread/queue/delete', params: { threadId, queuedSubmissionId: 'queued-1' } },
+      { method: 'thread/queue/reorder', params: { threadId, queuedSubmissionIds: ['queued-2', 'queued-1'] } },
+      { method: 'thread/queue/start', params: { threadId } },
+    ]);
+  } finally {
+    CodexAppServerService.prototype.nativeRequest = originalNativeRequest;
+  }
+});
+
+test('persistent native queue listing follows opaque cursors and combines empty pages', async () => {
+  const data = { channelId: 'native-queue-pages', cwd: testCwd,
+    codexCommandPrefix: peerCommandPrefix('early-notification'), message: 'open native thread' };
+  await codexSendPersistent(data);
+  const threadId = codexEvents().find(event => event.channelId === data.channelId && event.kind === 'turnStarted').threadId;
+  const expectedRuntimeGeneration = getCodexRuntimeSnapshot().sessions[0].runtimeGeneration;
+  const originalNativeRequest = CodexAppServerService.prototype.nativeRequest;
+  const pages = [
+    { data: [{ id: 'queue-a' }], nextCursor: 'opaque-a' },
+    { data: [], nextCursor: 'opaque-b' },
+    { data: [{ id: 'queue-b' }], nextCursor: null },
+  ];
+  const calls = [];
+  CodexAppServerService.prototype.nativeRequest = async function (method, params, options) {
+    calls.push({ method, params, options });
+    return pages.shift();
+  };
+  try {
+    assert.deepEqual(await codexQueueListPersistent({ ...data, threadId }), {
+      data: [{ id: 'queue-a' }, { id: 'queue-b' }], nextCursor: null,
+    });
+    assert.deepEqual(calls, [
+      { method: 'thread/queue/list', params: { threadId }, options: { expectedRuntimeGeneration } },
+      { method: 'thread/queue/list', params: { threadId, cursor: 'opaque-a' }, options: { expectedRuntimeGeneration } },
+      { method: 'thread/queue/list', params: { threadId, cursor: 'opaque-b' }, options: { expectedRuntimeGeneration } },
+    ]);
+    assert.equal(pages.length, 0);
+  } finally {
+    CodexAppServerService.prototype.nativeRequest = originalNativeRequest;
+  }
+});
+
+test('persistent native queue listing rejects repeated cursors and propagates native failures', async () => {
+  const data = { channelId: 'native-queue-page-errors', cwd: testCwd,
+    codexCommandPrefix: peerCommandPrefix('early-notification'), message: 'open native thread' };
+  await codexSendPersistent(data);
+  const threadId = codexEvents().find(event => event.channelId === data.channelId && event.kind === 'turnStarted').threadId;
+  const originalNativeRequest = CodexAppServerService.prototype.nativeRequest;
+  const calls = [];
+  let responder;
+  CodexAppServerService.prototype.nativeRequest = async function (method, params, options) {
+    calls.push({ method, params, options });
+    return responder(method, params, options);
+  };
+  try {
+    responder = async () => ({ data: [{ id: 'partial' }], nextCursor: 'repeat-me' });
+    await assert.rejects(codexQueueListPersistent({ ...data, threadId }), error =>
+      error.code === 'INVALID_RESPONSE' && /repeated.*cursor/i.test(error.message));
+    assert.equal(calls.length, 2, 'the repeated cursor is rejected before another page request');
+
+    calls.length = 0;
+    const unsupported = Object.assign(new Error('method unsupported'), { code: 'UNSUPPORTED' });
+    responder = async () => { throw unsupported; };
+    await assert.rejects(codexQueueListPersistent({ ...data, threadId }), error => error === unsupported);
+    assert.equal(calls.length, 1, 'an unsupported method is not retried');
+
+    calls.length = 0;
+    const transportFailure = Object.assign(new Error('transport failed'), { code: 'CHILD_EXITED' });
+    let page = 0;
+    responder = async () => {
+      page += 1;
+      if (page === 1) return { data: [{ id: 'partial' }], nextCursor: 'next-page' };
+      throw transportFailure;
+    };
+    await assert.rejects(codexQueueListPersistent({ ...data, threadId }), error => error === transportFailure);
+    assert.equal(calls.length, 2, 'transport errors stop pagination without returning a partial snapshot');
+  } finally {
+    CodexAppServerService.prototype.nativeRequest = originalNativeRequest;
+  }
+});
+
+test('persistent native queue listing rejects a response from a replaced runtime generation', async () => {
+  const data = { channelId: 'native-queue-generation-race', cwd: testCwd,
+    codexCommandPrefix: peerCommandPrefix('early-notification'), message: 'open native thread' };
+  await codexSendPersistent(data);
+  const threadId = codexEvents().find(event => event.channelId === data.channelId && event.kind === 'turnStarted').threadId;
+  const originalNativeRequest = CodexAppServerService.prototype.nativeRequest;
+  let service;
+  let originalGeneration;
+  let signalFirstRequest;
+  let releaseFirstResponse;
+  const firstRequest = new Promise(resolve => { signalFirstRequest = resolve; });
+  const firstResponse = new Promise(resolve => { releaseFirstResponse = resolve; });
+  const calls = [];
+  CodexAppServerService.prototype.nativeRequest = async function (method, params, options) {
+    calls.push({ method, params, options });
+    if (calls.length === 1) {
+      service = this;
+      originalGeneration = this.runtimeGeneration;
+      signalFirstRequest();
+      return await firstResponse;
+    }
+    return await originalNativeRequest.call(this, method, params, options);
+  };
+  try {
+    const expectedRuntimeGeneration = getCodexRuntimeSnapshot().sessions[0].runtimeGeneration;
+    const listing = codexQueueListPersistent({ ...data, threadId });
+    await firstRequest;
+    service.runtimeGeneration += 1;
+    releaseFirstResponse({ data: [{ id: 'partial' }], nextCursor: 'next-page' });
+    await assert.rejects(listing, error => error.code === 'RUNTIME_RESET');
+    assert.equal(calls.length, 1, 'a page from a replaced runtime is rejected before requesting another');
+    assert.deepEqual(calls.map(call => call.options), [{ expectedRuntimeGeneration }]);
+  } finally {
+    if (service && originalGeneration !== undefined) service.runtimeGeneration = originalGeneration;
+    CodexAppServerService.prototype.nativeRequest = originalNativeRequest;
+  }
+});
+
+test('persistent native queue listing pins each page to the first runtime and stops after release', async () => {
+  const data = { channelId: 'native-queue-release-race', cwd: testCwd,
+    codexCommandPrefix: peerCommandPrefix('early-notification'), message: 'open native thread' };
+  await codexSendPersistent(data);
+  const threadId = codexEvents().find(event => event.channelId === data.channelId && event.kind === 'turnStarted').threadId;
+  const originalNativeRequest = CodexAppServerService.prototype.nativeRequest;
+  const calls = [];
+  let released = false;
+  CodexAppServerService.prototype.nativeRequest = async function (method, params, options) {
+    calls.push({ method, params, options });
+    if (calls.length === 1) {
+      await codexReleaseThreadPersistent({ ...data, threadId });
+      released = true;
+      return { data: [{ id: 'partial' }], nextCursor: 'next-page' };
+    }
+    return await originalNativeRequest.call(this, method, params, options);
+  };
+  try {
+    await assert.rejects(codexQueueListPersistent({ ...data, threadId }), error => error.code === 'RUNTIME_RESET');
+    assert.equal(released, true);
+    assert.equal(calls.length, 1, 'a released service cannot contribute a queue page');
+    assert.equal(getCodexRuntimeSnapshot().sessionCount, 0, 'pagination does not cold-start a released writer');
+  } finally {
+    CodexAppServerService.prototype.nativeRequest = originalNativeRequest;
+  }
+});
+
+test('persistent steer captures the native turn id from its active operation', async () => {
+  const data = { channelId: 'native-steer-api', cwd: testCwd,
+    codexCommandPrefix: peerCommandPrefix('never-respond'), message: 'hold this turn open' };
+  const sending = codexSendPersistent(data);
+  let turnStarted = null;
+  for (let i = 0; i < 200 && !turnStarted; i += 1) {
+    await new Promise(resolve => setTimeout(resolve, 20));
+    turnStarted = codexEvents().find(event => event.channelId === data.channelId && event.kind === 'turnStarted');
+  }
+  assert.ok(turnStarted, 'native active turn surfaced');
+  const originalNativeRequest = CodexAppServerService.prototype.nativeRequest;
+  const calls = [];
+  CodexAppServerService.prototype.nativeRequest = async function (method, params, options) {
+    calls.push({ method, params, options });
+    return { accepted: true };
+  };
+  try {
+    const input = [{ type: 'text', text: 'guide the active turn' }];
+    assert.deepEqual(await codexSteerPersistent({ ...data, threadId: turnStarted.threadId,
+      expectedTurnId: turnStarted.turnId, input }), { accepted: true });
+    assert.deepEqual(calls, [{ method: 'turn/steer', params: {
+      threadId: turnStarted.threadId, expectedTurnId: turnStarted.turnId, input,
+    }, options: { expectedRuntimeGeneration: 1 } }]);
+  } finally {
+    CodexAppServerService.prototype.nativeRequest = originalNativeRequest;
+    await codexAbortTurnPersistent({ channelId: data.channelId, cwd: testCwd }).catch(() => {});
+    await sending.catch(() => {});
+  }
+});
+
+test('persistent fork uses the native request with its source thread and last-turn boundary', async () => {
+  const data = { ...forkTestData('native-fork-api'), message: 'open native thread' };
+  await codexSendPersistent(data);
+  const threadId = codexEvents().find(event => event.channelId === data.channelId && event.kind === 'turnStarted').threadId;
+  const originalNativeRequest = CodexAppServerService.prototype.nativeRequest;
+  const originalReadOnly = CodexAppServerService.prototype.readOnly;
+  const originalInheritFork = CodexPrivacyIndex.prototype.inheritFork;
+  const calls = [];
+  const reads = [];
+  const inheritCalls = [];
+  let index;
+  CodexAppServerService.prototype.nativeRequest = async function (method, params, options) {
+    index = this.privacyIndex;
+    calls.push({ method, params, options });
+    return { thread: { id: 'th-forked-0002' } };
+  };
+  CodexAppServerService.prototype.readOnly = async function (method, params) {
+    reads.push({ method, params });
+    index = this.privacyIndex;
+    if (method === 'thread/list') {
+      if (params.archived === false && params.cursor === null) {
+        return { data: [{ id: threadId }, { id: 'existing-active-thread' }], nextCursor: 'active-page-2' };
+      }
+      if (params.archived === false && params.cursor === 'active-page-2') {
+        return { data: [{ id: 'second-page-active-thread' }], nextCursor: null };
+      }
+      if (params.archived === true && params.cursor === null) {
+        return { data: [{ id: 'existing-archived-thread' }], nextCursor: null };
+      }
+      throw new Error(`unexpected fork baseline page: ${JSON.stringify(params)}`);
+    }
+    const turns = [{ id: 'turn-test-0001', items: [{ id: 'item-test-0001' }] }];
+    return { thread: { id: params.threadId, turns } };
+  };
+  CodexPrivacyIndex.prototype.inheritFork = async function (params) { inheritCalls.push(params); };
+  try {
+    const result = await codexForkThreadPersistent({ ...data, threadId, lastTurnId: 'turn-test-0001' });
+    assert.deepEqual(result, { thread: { id: 'th-forked-0002' } });
+    assert.deepEqual(calls, [{ method: 'thread/fork', params: { threadId, lastTurnId: 'turn-test-0001' },
+      options: { expectedRuntimeGeneration: 1 } }]);
+    assert.deepEqual(reads.filter(call => call.method === 'thread/list')
+      .map(call => [call.params.archived, call.params.cursor]), [
+      [false, null], [false, 'active-page-2'], [true, null],
+    ]);
+    // Opening-thread naming may concurrently perform a metadata-only read.
+    assert.deepEqual(reads.filter(call => call.params.includeTurns === true), [
+      { method: 'thread/read', params: { threadId, includeTurns: true } },
+      { method: 'thread/read', params: { threadId: 'th-forked-0002', includeTurns: true } },
+    ]);
+    assert.equal(inheritCalls.length, 1);
+    assert.equal(inheritCalls[0].sourceThreadId, threadId);
+    assert.equal(inheritCalls[0].forkThreadId, 'th-forked-0002');
+    assert.equal(inheritCalls[0].lastTurnId, 'turn-test-0001');
+  } finally {
+    CodexAppServerService.prototype.nativeRequest = originalNativeRequest;
+    CodexAppServerService.prototype.readOnly = originalReadOnly;
+    CodexPrivacyIndex.prototype.inheritFork = originalInheritFork;
+    await cleanupForkProtectionRecords(index);
+  }
+});
+
+test('persistent fork requires its explicit boundary and a distinct native result id', async () => {
+  await assert.rejects(codexForkThreadPersistent({ threadId: 'source' }),
+    error => error.code === 'INVALID_PARAMS');
+  const data = forkTestData('native-fork-missing-id');
+  await codexPreconnectPersistent(data);
+  const originalNativeRequest = CodexAppServerService.prototype.nativeRequest;
+  const originalReadOnly = CodexAppServerService.prototype.readOnly;
+  const originalBegin = CodexPrivacyIndex.prototype.beginForkProtection;
+  let index;
+  CodexPrivacyIndex.prototype.beginForkProtection = async function () {
+    index = this;
+    return await originalBegin.call(this);
+  };
+  CodexAppServerService.prototype.nativeRequest = async () => ({ thread: { name: 'missing id' } });
+  CodexAppServerService.prototype.readOnly = async (method) => {
+    if (method === 'thread/list') return { data: [], nextCursor: null };
+    throw new Error(`unexpected native read: ${method}`);
+  };
+  try {
+    await assert.rejects(codexForkThreadPersistent({ ...data,
+      threadId: 'source', lastTurnId: 'turn-1' }), error => error.code === 'INVALID_RESPONSE');
+  } finally {
+    CodexAppServerService.prototype.nativeRequest = originalNativeRequest;
+    CodexAppServerService.prototype.readOnly = originalReadOnly;
+    CodexPrivacyIndex.prototype.beginForkProtection = originalBegin;
+    await cleanupForkProtectionRecords(index);
+  }
+});
+
+test('persistent fork refuses the native side effect if its guard cannot be persisted', async () => {
+  const originalBegin = CodexPrivacyIndex.prototype.beginForkProtection;
+  const originalNative = CodexAppServerService.prototype.nativeRequest;
+  let requests = 0;
+  CodexPrivacyIndex.prototype.beginForkProtection = async () => { throw new Error('guard write failed'); };
+  CodexAppServerService.prototype.nativeRequest = async () => { requests++; };
+  try {
+    await assert.rejects(codexForkThreadPersistent({ channelId: 'fork-guard-failure', cwd: testCwd,
+      threadId: 'source', lastTurnId: 'turn' }), /guard write failed/);
+    assert.equal(requests, 0);
+  } finally {
+    CodexPrivacyIndex.prototype.beginForkProtection = originalBegin;
+    CodexAppServerService.prototype.nativeRequest = originalNative;
+  }
+});
+
+test('persistent fork does not call the native fork when its thread snapshot fails', async () => {
+  const data = forkTestData('fork-snapshot-failure');
+  await codexPreconnectPersistent(data);
+  const originalBegin = CodexPrivacyIndex.prototype.beginForkProtection;
+  const originalNative = CodexAppServerService.prototype.nativeRequest;
+  const originalRead = CodexAppServerService.prototype.readOnly;
+  let index;
+  let readCount = 0;
+  const nativeCalls = [];
+  CodexPrivacyIndex.prototype.beginForkProtection = async function (...args) {
+    index = this;
+    return await originalBegin.apply(this, args);
+  };
+  CodexAppServerService.prototype.nativeRequest = async function (...args) {
+    nativeCalls.push(args);
+    throw new Error('native fork must not run after an incomplete snapshot');
+  };
+  CodexAppServerService.prototype.readOnly = async (method, params) => {
+    assert.equal(method, 'thread/list');
+    readCount += 1;
+    if (params.archived === false && params.cursor === null) {
+      return { data: [{ id: 'source-thread' }], nextCursor: 'next-page' };
+    }
+    throw new Error('thread catalog page failed');
+  };
+  try {
+    await assert.rejects(codexForkThreadPersistent({ ...data, threadId: 'source-thread', lastTurnId: 'turn-1' }),
+      /thread catalog page failed/);
+    assert.equal(readCount, 2, 'the second catalog page failed before forking');
+    assert.deepEqual(nativeCalls, [], 'an incomplete baseline must not reach thread/fork');
+    const names = await readdir(index.rootDir);
+    assert.equal(names.some(name => name.startsWith(index.recordPrefix)
+      && /fork-(?:pending|quarantine)\./.test(name)), false,
+    'a known pre-fork snapshot failure removes its temporary protection record');
+  } finally {
+    CodexPrivacyIndex.prototype.beginForkProtection = originalBegin;
+    CodexAppServerService.prototype.nativeRequest = originalNative;
+    CodexAppServerService.prototype.readOnly = originalRead;
+    await cleanupForkProtectionRecords(index);
+  }
+});
+
+for (const scenario of ['classification-write-failure', 'ambiguous-timeout', 'unsupported']) {
+  test(`persistent fork guard handles ${scenario} without exposing unknown fork history`, async () => {
+    const data = forkTestData(`fork-${scenario}`);
+    await codexPreconnectPersistent(data);
+    const originalBegin = CodexPrivacyIndex.prototype.beginForkProtection;
+    const originalNative = CodexAppServerService.prototype.nativeRequest;
+    const originalRead = CodexAppServerService.prototype.readOnly;
+    const originalMark = CodexPrivacyIndex.prototype.markThreadConservative;
+    let index;
+    CodexPrivacyIndex.prototype.beginForkProtection = async function () {
+      index = this;
+      return await originalBegin.call(this);
+    };
+    CodexAppServerService.prototype.nativeRequest = async () => {
+      const fresh = new CodexPrivacyIndex({ rootDir: index.rootDir, scope: index.scope });
+      await fresh.load();
+      assert.equal(fresh.isConservativeThread('unknown-fork'), true);
+      if (scenario !== 'classification-write-failure') {
+        throw Object.assign(new Error(scenario), { code: scenario === 'unsupported' ? 'UNSUPPORTED' : 'RPC_TIMEOUT' });
+      }
+      return { thread: { id: 'unknown-fork' } };
+    };
+    CodexAppServerService.prototype.readOnly = async (method) => {
+      if (method === 'thread/list') return { data: [], nextCursor: null };
+      throw new Error('history read failed');
+    };
+    CodexPrivacyIndex.prototype.markThreadConservative = async () => { throw new Error('marker write failed'); };
+    try {
+      await assert.rejects(codexForkThreadPersistent({ ...data, threadId: 'source', lastTurnId: 'turn' }));
+      const fresh = new CodexPrivacyIndex({ rootDir: index.rootDir, scope: index.scope });
+      await fresh.load();
+      assert.equal(fresh.isConservativeThread('unknown-fork'), scenario !== 'unsupported');
+      if (scenario !== 'unsupported') {
+        assert.doesNotMatch(JSON.stringify(fresh.redact({ type: 'functionCallOutput',
+          output: 'copied secret' }, { threadId: 'unknown-fork' })), /copied secret/);
+      }
+    } finally {
+      CodexPrivacyIndex.prototype.beginForkProtection = originalBegin;
+      CodexAppServerService.prototype.nativeRequest = originalNative;
+      CodexAppServerService.prototype.readOnly = originalRead;
+      CodexPrivacyIndex.prototype.markThreadConservative = originalMark;
+      await cleanupForkProtectionRecords(index);
+    }
+  });
+}
+
+test('a quarantined unknown fork remains masked while a later fork can proceed', async () => {
+  const data = forkTestData('fork-quarantine-retry');
+  await codexPreconnectPersistent(data);
+  const originalNative = CodexAppServerService.prototype.nativeRequest;
+  const originalRead = CodexAppServerService.prototype.readOnly;
+  const originalBegin = CodexPrivacyIndex.prototype.beginForkProtection;
+  let index;
+  let nativeForks = 0;
+  CodexPrivacyIndex.prototype.beginForkProtection = async function (...args) {
+    index = this;
+    return await originalBegin.apply(this, args);
+  };
+  CodexAppServerService.prototype.nativeRequest = async function (method) {
+    assert.equal(method, 'thread/fork');
+    nativeForks += 1;
+    if (nativeForks === 1) throw Object.assign(new Error('ambiguous timeout'), { code: 'RPC_TIMEOUT' });
+    return { thread: { id: 'later-fork' } };
+  };
+  CodexAppServerService.prototype.readOnly = async function (method, params) {
+    if (method === 'thread/list') {
+      assert.equal(params.limit, 100);
+      return { data: params.archived ? [] : [{ id: 'source-thread' }], nextCursor: null };
+    }
+    assert.equal(method, 'thread/read');
+    return { thread: { id: params.threadId, turns: [{ id: 'turn-1', items: [] }] } };
+  };
+  try {
+    await assert.rejects(codexForkThreadPersistent({ ...data, threadId: 'source-thread', lastTurnId: 'turn-1' }),
+      error => error.code === 'RPC_TIMEOUT');
+    let names = await readdir(index.rootDir);
+    assert.ok(names.some(name => name.startsWith(index.recordPrefix) && name.includes('fork-quarantine.')),
+      'the uncertain result is retained as a quarantine record');
+
+    assert.deepEqual(await codexForkThreadPersistent({ ...data, threadId: 'source-thread', lastTurnId: 'turn-1' }),
+      { thread: { id: 'later-fork' } });
+    assert.equal(nativeForks, 2, 'the quarantine does not block the next fork');
+    const fresh = new CodexPrivacyIndex({ rootDir: index.rootDir, scope: index.scope });
+    await fresh.load();
+    assert.equal(fresh.isConservativeThread('unknown-fork'), true,
+      'the first fork remains protected despite the later successful fork');
+    assert.equal(fresh.isConservativeThread('later-fork'), false,
+      'the newly classified fork is trusted');
+    names = await readdir(index.rootDir);
+    assert.equal(names.some(name => name.startsWith(index.recordPrefix) && name.includes('fork-pending.')), false,
+      'the successful fork has no leftover pending transaction');
+  } finally {
+    CodexPrivacyIndex.prototype.beginForkProtection = originalBegin;
+    CodexAppServerService.prototype.nativeRequest = originalNative;
+    CodexAppServerService.prototype.readOnly = originalRead;
+    await cleanupForkProtectionRecords(index);
+  }
+});
+
+test('persistent fork falls back to a durable fork-only mask when history mapping fails', async () => {
+  const data = { ...forkTestData('native-fork-mask'), message: 'open fork mask thread' };
+  await codexSendPersistent(data);
+  const threadId = codexEvents().find(event => event.channelId === data.channelId && event.kind === 'turnStarted').threadId;
+  const originalNativeRequest = CodexAppServerService.prototype.nativeRequest;
+  const originalReadOnly = CodexAppServerService.prototype.readOnly;
+  const originalMark = CodexPrivacyIndex.prototype.markThreadConservative;
+  const masked = [];
+  CodexAppServerService.prototype.nativeRequest = async () => ({ thread: { id: 'th-fork-mask-0002' } });
+  CodexAppServerService.prototype.readOnly = async (method) => {
+    if (method === 'thread/list') return { data: [], nextCursor: null };
+    throw new Error('history unavailable');
+  };
+  CodexPrivacyIndex.prototype.markThreadConservative = async function (forkId) { masked.push(forkId); };
+  try {
+    const result = await codexForkThreadPersistent({ ...data, threadId, lastTurnId: 'turn-test-0001' });
+    assert.equal(result.thread.id, 'th-fork-mask-0002');
+    assert.deepEqual(masked, ['th-fork-mask-0002']);
+  } finally {
+    CodexAppServerService.prototype.nativeRequest = originalNativeRequest;
+    CodexAppServerService.prototype.readOnly = originalReadOnly;
+    CodexPrivacyIndex.prototype.markThreadConservative = originalMark;
+  }
 });

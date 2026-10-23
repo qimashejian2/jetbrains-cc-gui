@@ -24,7 +24,9 @@ vi.mock('./MessageItem', () => ({
 }));
 
 vi.mock('./WaitingIndicator', () => ({
-  default: () => <div data-testid="waiting-indicator">waiting</div>,
+  default: ({ label, showElapsed }: { label?: string; showElapsed?: boolean }) => (
+    <div data-testid="waiting-indicator" data-label={label} data-show-elapsed={String(showElapsed)}>waiting</div>
+  ),
 }));
 
 vi.mock('./ContextMenu', () => ({
@@ -479,5 +481,29 @@ describe('MessageList container behaviour', () => {
       />
     );
     expect(screen.getByTestId('waiting-indicator')).toBeTruthy();
+  });
+
+  it('passes the native Codex phase label and suppresses elapsed time before turn start', () => {
+    const endRef = createRef<HTMLDivElement>();
+    render(
+      <MessageList
+        messages={makeMessages(1)}
+        messageKeys={keysFor(makeMessages(1))}
+        streamingActive={false}
+        isThinking={false}
+        loading
+        loadingStartTime={null}
+        waitingLabel="Thinking"
+        showWaitingElapsed={false}
+        t={t}
+        getMessageText={noopGetText}
+        getContentBlocks={noopGetBlocks}
+        findToolResult={noopFindToolResult}
+        extractMarkdownContent={noopExtractMd}
+        messagesEndRef={endRef}
+      />
+    );
+    expect(screen.getByTestId('waiting-indicator').getAttribute('data-label')).toBe('Thinking');
+    expect(screen.getByTestId('waiting-indicator').getAttribute('data-show-elapsed')).toBe('false');
   });
 });

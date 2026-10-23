@@ -7,6 +7,8 @@ import com.intellij.openapi.diagnostic.Logger;
 import org.junit.Test;
 
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.Assert.assertEquals;
@@ -85,6 +87,121 @@ public class CodexAppServerRequestExecutorTest {
                 new RejectingDaemon(), "codex.respondInteraction", new JsonObject(), 1000L);
 
         assertTrue(result.has("error"));
+    }
+
+    @Test
+    public void nativeCommandKeepsTheDaemonEnvelopeAndRequestParameters() {
+        JsonObject params = new JsonObject();
+        params.addProperty("threadId", "thread-1");
+        params.addProperty("expectedTurnId", "turn-1");
+        params.addProperty("timeoutMs", 1250);
+        params.add("input", com.google.gson.JsonParser.parseString("[{\"type\":\"text\",\"text\":\"guide\"}]").getAsJsonArray());
+        JsonObject nativeResult = new JsonObject();
+        nativeResult.addProperty("queuedSubmissionId", "queued-1");
+        JsonObject response = new JsonObject();
+        response.addProperty("id", "native-1");
+        response.addProperty("done", true);
+        response.addProperty("success", true);
+        response.add("result", nativeResult);
+        DaemonBridge daemon = new DaemonBridge(null, null, null) {
+            @Override
+            public CompletableFuture<Boolean> sendCommand(String method, JsonObject sentParams, DaemonOutputCallback callback) {
+                assertEquals("codex.steer", method);
+                assertEquals(params, sentParams);
+                callback.onResult(response);
+                callback.onComplete(true);
+                return CompletableFuture.completedFuture(true);
+            }
+        };
+        CodexAppServerRequestExecutor executor = new CodexAppServerRequestExecutor(
+                Logger.getInstance(CodexAppServerRequestExecutorTest.class), null);
+
+        JsonObject result = executor.sendNativeCommand(daemon, "codex.steer", params, 1250L);
+
+        assertEquals(response, result);
+        assertEquals("queued-1", result.getAsJsonObject("result").get("queuedSubmissionId").getAsString());
+    }
+
+    @Test
+    public void nativeCommandPreservesNodeErrorCodeTextAndStructuredResult() {
+        JsonObject nativeResult = new JsonObject();
+        nativeResult.addProperty("method", "thread/queue/list");
+        JsonObject response = new JsonObject();
+        response.addProperty("id", "native-2");
+        response.addProperty("done", true);
+        response.addProperty("success", false);
+        response.addProperty("error", "Codex App Server does not support thread/queue/list");
+        response.addProperty("code", "UNSUPPORTED");
+        response.add("result", nativeResult);
+        DaemonBridge daemon = new DaemonBridge(null, null, null) {
+            @Override
+            public CompletableFuture<Boolean> sendCommand(String method, JsonObject params, DaemonOutputCallback callback) {
+                callback.onResult(response);
+                callback.onError(response.get("error").getAsString());
+                callback.onComplete(false);
+                return CompletableFuture.failedFuture(new RuntimeException("Node rejected native method"));
+            }
+        };
+        CodexAppServerRequestExecutor executor = new CodexAppServerRequestExecutor(
+                Logger.getInstance(CodexAppServerRequestExecutorTest.class), null);
+
+        JsonObject result = executor.sendNativeCommand(daemon, "codex.queueList", new JsonObject(), 1000L);
+
+        assertEquals("UNSUPPORTED", result.get("code").getAsString());
+        assertEquals("Codex App Server does not support thread/queue/list", result.get("error").getAsString());
+        assertEquals(nativeResult, result.getAsJsonObject("result"));
+    }
+
+    @Test
+    public void nativeCommandHasAStableTimeoutCode() {
+        DaemonBridge daemon = new DaemonBridge(null, null, null) {
+            @Override
+            public CompletableFuture<Boolean> sendCommand(String method, JsonObject params, DaemonOutputCallback callback) {
+                return new CompletableFuture<>();
+            }
+        };
+        CodexAppServerRequestExecutor executor = new CodexAppServerRequestExecutor(
+                Logger.getInstance(CodexAppServerRequestExecutorTest.class), null);
+
+        JsonObject result = executor.sendNativeCommand(daemon, "codex.fork", new JsonObject(), 1L);
+
+        assertEquals("DAEMON_TIMEOUT", result.get("code").getAsString());
+        assertTrue(result.get("error").getAsString().contains("timed out"));
+    }
+
+    @Test
+    public void nativeCommandCompletesWhileLongSendIsPending() throws Exception {
+        CountDownLatch sendStarted = new CountDownLatch(1);
+        CompletableFuture<Boolean> sendCompletion = new CompletableFuture<>();
+        DaemonBridge daemon = new DaemonBridge(null, null, null) {
+            @Override public boolean isAlive() { return true; }
+
+            @Override
+            public CompletableFuture<Boolean> sendCommand(String method, JsonObject params, DaemonOutputCallback callback) {
+                if ("codex.send".equals(method)) {
+                    sendStarted.countDown();
+                    return sendCompletion;
+                }
+                JsonObject response = new JsonObject();
+                response.addProperty("done", true);
+                response.addProperty("success", true);
+                response.addProperty("result", "native-ack");
+                callback.onResult(response);
+                callback.onComplete(true);
+                return CompletableFuture.completedFuture(true);
+            }
+        };
+        CodexAppServerRequestExecutor executor = new CodexAppServerRequestExecutor(
+                Logger.getInstance(CodexAppServerRequestExecutorTest.class), null);
+
+        CompletableFuture<SDKResult> send = executor.sendMessageViaDaemon(daemon, new JsonObject());
+        assertTrue(sendStarted.await(1, TimeUnit.SECONDS));
+        JsonObject nativeResult = executor.sendNativeCommand(daemon, "codex.queueStart", new JsonObject(), 1000L);
+
+        assertEquals("native-ack", nativeResult.get("result").getAsString());
+        assertTrue("the native control must not wait for codex.send", !send.isDone());
+        sendCompletion.complete(true);
+        assertTrue(send.get(1, TimeUnit.SECONDS).success);
     }
 
     @Test

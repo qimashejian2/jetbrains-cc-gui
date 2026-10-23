@@ -12,11 +12,39 @@
   min-height: 32px;
 }
 
+.chat-input-box[data-provider="codex"] .context-bar {
+  gap: 8px;
+  min-height: 28px;
+  padding: 0 10px 4px;
+  background: transparent;
+}
+
+.chat-input-box[data-provider="codex"] .context-tool-divider {
+  display: none;
+}
+
+.chat-input-box[data-provider="codex"] .context-tool-btn {
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+}
+
+.chat-input-box[data-provider="codex"] .context-tool-btn svg {
+  width: 16px;
+  height: 16px;
+  stroke-width: 1.75;
+}
+
 /* Ensure the first visible child element (usually ContextBar or AttachmentList) has rounded corners */
 /* ResizeHandles are absolutely positioned :first-child, so select the next visible element after them */
 .chat-input-box > .resize-handle + * {
   border-top-left-radius: 8px;
   border-top-right-radius: 8px;
+}
+
+.chat-input-box[data-provider="codex"] > .resize-handle + * {
+  border-top-left-radius: 24px;
+  border-top-right-radius: 24px;
 }
 
 .context-tools {

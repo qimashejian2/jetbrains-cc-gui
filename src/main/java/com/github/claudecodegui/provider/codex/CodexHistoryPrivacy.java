@@ -30,6 +30,9 @@ public final class CodexHistoryPrivacy {
             "codexTurnId", "tool_use_id", "name", "role", "clientMessageId", "uuid");
     private static volatile String cachedHomeScope;
     private final List<JsonObject> entries = new ArrayList<>();
+    private final Set<String> conservativeThreadIds = new HashSet<>();
+    private final List<Set<String>> threadQuarantines = new ArrayList<>();
+    private final Set<String> trustedThreadIds = new HashSet<>();
     private final String sessionId;
     private String currentTurnId;
     private boolean conservativeMasking;
@@ -61,14 +64,38 @@ public final class CodexHistoryPrivacy {
                 try {
                     JsonObject index = JsonParser.parseString(Files.readString(file)).getAsJsonObject();
                     if (!index.has("version") || !index.get("version").isJsonPrimitive()
-                            || !index.getAsJsonPrimitive("version").isNumber() || index.get("version").getAsDouble() != 1
+                            || !index.getAsJsonPrimitive("version").isNumber()
+                            || (index.get("version").getAsDouble() != 1
+                            && index.get("version").getAsDouble() != 2)
                             || !index.has("entries") || !index.get("entries").isJsonArray()) {
                         this.conservativeMasking = true;
                         return;
                     }
+                    int version = index.get("version").getAsInt();
                     JsonElement conservative = index.get("conservativeMasking");
                     if (conservative != null && (!conservative.isJsonPrimitive()
                             || !conservative.getAsJsonPrimitive().isBoolean() || conservative.getAsBoolean())) {
+                        this.conservativeMasking = true;
+                    }
+                    Set<String> conservativeThreads = readIdArray(index, "conservativeThreadIds");
+                    if (conservativeThreads == null) {
+                        this.conservativeMasking = true;
+                    } else {
+                        this.conservativeThreadIds.addAll(conservativeThreads);
+                    }
+                    if (version == 2) {
+                        Set<String> safeThreads = readIdArray(index, "conservativeExceptThreadIds");
+                        Set<String> trustedThreads = readIdArray(index, "trustedThreadIds");
+                        if (safeThreads == null || trustedThreads == null) {
+                            this.conservativeMasking = true;
+                        } else {
+                            if (index.has("conservativeExceptThreadIds")) {
+                                this.threadQuarantines.add(safeThreads);
+                            }
+                            this.trustedThreadIds.addAll(trustedThreads);
+                        }
+                    } else if (index.has("conservativeExceptThreadIds") || index.has("trustedThreadIds")) {
+                        // These fields define v2 isolation policy and cannot establish trust in v1 records.
                         this.conservativeMasking = true;
                     }
                     for (JsonElement element : index.getAsJsonArray("entries")) {
@@ -90,6 +117,31 @@ public final class CodexHistoryPrivacy {
         } catch (Exception ignored) {
             this.conservativeMasking = true;
         }
+        if (sessionId == null) {
+            this.conservativeMasking |= !this.conservativeThreadIds.isEmpty() || !this.threadQuarantines.isEmpty();
+        } else {
+            this.conservativeMasking |= this.conservativeThreadIds.contains(sessionId)
+                    || this.threadQuarantines.stream().anyMatch(safeThreads ->
+                    !safeThreads.contains(sessionId) && !this.trustedThreadIds.contains(sessionId));
+        }
+    }
+
+    private static Set<String> readIdArray(JsonObject record, String name) {
+        if (!record.has(name)) {
+            return new HashSet<>();
+        }
+        JsonElement value = record.get(name);
+        if (!value.isJsonArray()) {
+            return null;
+        }
+        Set<String> ids = new HashSet<>();
+        for (JsonElement id : value.getAsJsonArray()) {
+            if (!id.isJsonPrimitive() || !id.getAsJsonPrimitive().isString() || id.getAsString().isBlank()) {
+                return null;
+            }
+            ids.add(id.getAsString());
+        }
+        return ids;
     }
 
     private static boolean validEntry(JsonElement element) {

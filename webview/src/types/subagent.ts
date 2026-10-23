@@ -1,7 +1,7 @@
 /**
  * Subagent status
  */
-export type SubagentStatus = 'running' | 'completed' | 'error';
+export type SubagentStatus = 'running' | 'waiting' | 'completed' | 'error';
 
 /**
  * Terminal status carried by a Claude Code task_notification SDK event.
@@ -101,6 +101,8 @@ export interface SubagentInfo {
   prompt?: string;
   /** Execution status */
   status: SubagentStatus;
+  /** A Codex lifecycle event is newer than the child-history snapshot. */
+  nativeStatusAuthoritative?: boolean;
   /**
    * True for async agents (Agent/Task tool with run_in_background:true).
    * Their terminal status arrives live via task_notification; after history
@@ -115,6 +117,8 @@ export interface SubagentInfo {
   agentPath?: string;
   /** Total runtime in milliseconds */
   totalDurationMs?: number;
+  /** Native launch time in milliseconds, when the transcript provides one. */
+  startedAt?: number;
   /** Total tokens reported by the Agent tool */
   totalTokens?: number;
   /** Total tool calls reported by the Agent tool */

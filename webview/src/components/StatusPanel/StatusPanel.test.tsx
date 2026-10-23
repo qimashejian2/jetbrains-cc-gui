@@ -107,4 +107,31 @@ describe('StatusPanel', () => {
 
     expect(screen.getByText(expectedLabel)).toBeTruthy();
   });
+
+  it('counts failed subagents as done in the shared activity progress', () => {
+    const subagent = (id: string, status: 'running' | 'waiting' | 'completed' | 'error') => ({
+      id,
+      type: 'Explore',
+      description: id,
+      status,
+      isAsync: true,
+      messageIndex: 0,
+    });
+    render(
+      <StatusPanel
+        todos={[]}
+        fileChanges={[]}
+        currentProvider="codex"
+        subagents={[
+          subagent('active', 'running'),
+          subagent('waiting', 'waiting'),
+          subagent('completed', 'completed'),
+          subagent('failed', 'error'),
+        ]}
+      />,
+    );
+
+    const tab = screen.getByText('statusPanel.subagentTab').closest('.status-panel-tab');
+    expect(tab?.textContent).toContain('2/4');
+  });
 });

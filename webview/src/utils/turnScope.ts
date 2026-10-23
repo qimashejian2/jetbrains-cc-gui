@@ -79,7 +79,8 @@ export function selectLatestSubagentTurn(
     return turnStart;
   });
 
-  return subagents.filter((agent, index) => turnStarts[index] === latestTurnStart || agent.isAsync && agent.status === 'running');
+  return subagents.filter((agent, index) => turnStarts[index] === latestTurnStart
+    || agent.isAsync && ['running', 'waiting'].includes(agent.status));
 }
 
 export function finalizeTodosForSettledTurn(

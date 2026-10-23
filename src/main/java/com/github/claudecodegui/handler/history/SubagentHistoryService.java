@@ -91,7 +91,15 @@ class SubagentHistoryService {
         }
 
         if ("codex".equals(provider)) {
-            this.loadCodexSubagentAsync(sessionId, toolUseId, agentPath, agentId, response);
+            CodexReadScope scope = captureCodexReadScope(sessionId);
+            if (scope == null) {
+                response.addProperty("success", false);
+                response.addProperty("status", "error");
+                response.addProperty("error", "Codex session changed before subagent history read (STALE_SESSION)");
+                sendResponse(response);
+                return;
+            }
+            this.loadCodexSubagentAsync(sessionId, toolUseId, agentPath, agentId, response, scope);
             return;
         }
         if (provider != null && !"claude".equals(provider)) {
@@ -197,6 +205,13 @@ class SubagentHistoryService {
         if (!this.isCurrentCodexRoot(responseSessionId)) {
             return;
         }
+        CodexReadScope readScope = captureCodexReadScope(responseSessionId);
+        if (readScope == null) {
+            response.addProperty("success", false);
+            response.addProperty("error", "Codex session changed before subagent status read (STALE_SESSION)");
+            sendStatusesResponse(response);
+            return;
+        }
         if (!this.inFlightCodexStatusSessions.add(responseSessionId)) {
             response.addProperty("success", false);
             response.addProperty("error", "Codex subagent status request already in progress");
@@ -211,7 +226,7 @@ class SubagentHistoryService {
                         return;
                     }
                     JsonObject nativeResult = this.readNativeSubagent(responseSessionId, agent.agentId(), false,
-                            previousTurns.get(agent.toolUseId()));
+                            previousTurns.get(agent.toolUseId()), readScope);
                     if (nativeResult != null) {
                         nativeResult.addProperty("toolUseId", agent.toolUseId());
                         nativeResult.addProperty("agentPath", agent.agentPath());
@@ -285,7 +300,8 @@ class SubagentHistoryService {
             String toolUseId,
             String agentPath,
             String agentId,
-            JsonObject response
+            JsonObject response,
+            CodexReadScope readScope
     ) {
         String previousTurnId = getString(response, "nativeTaskPreviousTurnId");
         String requestKey = "codex:" + sessionId + ":" + toolUseId + ":" + agentPath + ":" + agentId + ":"
@@ -295,7 +311,8 @@ class SubagentHistoryService {
         }
         CompletableFuture.runAsync(() -> {
             try {
-                JsonObject nativeResult = this.readNativeSubagent(sessionId, agentId, true, previousTurnId);
+                JsonObject nativeResult = this.readNativeSubagent(
+                        sessionId, agentId, true, previousTurnId, readScope);
                 if (nativeResult != null) {
                     for (var entry : nativeResult.entrySet()) {
                         response.add(entry.getKey(), entry.getValue());
@@ -340,22 +357,23 @@ class SubagentHistoryService {
         return session == null || java.util.Objects.equals(sessionId, session.getSessionId());
     }
 
-    private JsonObject readNativeSubagent(String rootThreadId, String agentId, boolean includeHistory, String previousTurnId) throws Exception {
+    private JsonObject readNativeSubagent(
+            String rootThreadId, String agentId, boolean includeHistory, String previousTurnId,
+            CodexReadScope readScope) throws Exception {
         var bridge = this.context.getCodexSDKBridge();
         if (bridge == null || agentId == null || agentId.isBlank()) {
             return null;
         }
         validateId("sessionId", rootThreadId);
         validateId("agentId", agentId);
-        var session = this.context.getSession();
         JsonObject params = new JsonObject();
         params.addProperty("agentId", agentId);
         params.addProperty("includeHistory", includeHistory);
         if (previousTurnId != null) {
             params.addProperty("nativeTaskPreviousTurnId", previousTurnId);
         }
-        JsonObject result = bridge.readCodexNative("codex.readSubagent", session == null ? "codex" : session.getChannelId(),
-                session == null ? this.context.getProject().getBasePath() : session.getCwd(), rootThreadId, params)
+        JsonObject result = bridge.readCodexNative("codex.readSubagent", readScope.channelId(),
+                readScope.cwd(), rootThreadId, params, readScope.epoch())
                 .get(125, java.util.concurrent.TimeUnit.SECONDS);
         if (result == null || result.has("error")) {
             String error = result == null ? "Native subagent returned no response" : getString(result, "error");
@@ -373,6 +391,23 @@ class SubagentHistoryService {
         }
         return result;
     }
+
+    private CodexReadScope captureCodexReadScope(String rootThreadId) {
+        var session = this.context.getSession();
+        if (session != null && !java.util.Objects.equals(rootThreadId, session.getSessionId())) {
+            return null;
+        }
+        var bridge = this.context.getCodexSDKBridge();
+        String channelId = session == null ? "codex" : session.getChannelId();
+        String cwd = session == null ? this.context.getProject().getBasePath() : session.getCwd();
+        if (bridge == null) {
+            return new CodexReadScope(channelId, cwd, null);
+        }
+        String epoch = bridge.captureRuntimeSessionEpoch(channelId);
+        return epoch == null ? null : new CodexReadScope(channelId, cwd, epoch);
+    }
+
+    private record CodexReadScope(String channelId, String cwd, String epoch) { }
 
     private JsonObject parseRequest(String content) {
         if (content == null || content.trim().isEmpty()) {

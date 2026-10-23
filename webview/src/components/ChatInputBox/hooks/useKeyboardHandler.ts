@@ -1,12 +1,15 @@
 import { useCallback, useMemo } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
-import type { SendShortcut } from '../types.js';
+import type { CodexFollowUpMode, SendShortcut } from '../types.js';
 import {
   claimEnterPress,
   isEnterKey,
+  isFollowUpOverrideKey,
+  isImeStillHoldingEnter,
   isImeStillComposing,
   isSendKey,
   releaseEnterKeyUp,
+  oppositeFollowUpMode,
   triageEnterKeyDown,
 } from '../utils/enterKeyGuard.js';
 import type { EnterKeyRefs } from '../utils/enterKeyGuard.js';
@@ -22,6 +25,8 @@ interface InlineCompletionHandler {
 
 export interface UseKeyboardHandlerOptions extends EnterKeyRefs {
   sendShortcut: SendShortcut;
+  currentProvider?: string;
+  codexFollowUpMode?: CodexFollowUpMode;
   fileCompletion: CompletionWithKeyDown;
   commandCompletion: CompletionWithKeyDown;
   agentCompletion: CompletionWithKeyDown;
@@ -39,7 +44,7 @@ export interface UseKeyboardHandlerOptions extends EnterKeyRefs {
   }) => boolean;
   /** Inline history completion (Tab to apply) */
   inlineCompletion?: InlineCompletionHandler;
-  handleSubmit: () => void;
+  handleSubmit: (followUpMode?: CodexFollowUpMode) => void;
 }
 
 /**
@@ -55,6 +60,8 @@ export function useKeyboardHandler({
   isComposingRef,
   lastCompositionEndTimeRef,
   sendShortcut,
+  currentProvider = 'claude',
+  codexFollowUpMode,
   fileCompletion,
   commandCompletion,
   agentCompletion,
@@ -117,6 +124,21 @@ export function useKeyboardHandler({
         return;
       }
 
+      if (currentProvider === 'codex' && codexFollowUpMode && isFollowUpOverrideKey(e.nativeEvent)) {
+        if (isImeStillHoldingEnter(
+          sendShortcut,
+          enterKeyRefs,
+          e.nativeEvent.isComposing,
+          e.metaKey || e.ctrlKey,
+        )) {
+          claimEnterPress(e, enterKeyRefs);
+          return;
+        }
+        claimEnterPress(e, enterKeyRefs);
+        handleSubmit(oppositeFollowUpMode(codexFollowUpMode));
+        return;
+      }
+
       // Handle inline history completion (Tab key)
       if (e.key === 'Tab' && inlineCompletion) {
         const applied = inlineCompletion.applySuggestion();
@@ -146,6 +168,8 @@ export function useKeyboardHandler({
       handleHistoryKeyDown,
       inlineCompletion,
       sendShortcut,
+      currentProvider,
+      codexFollowUpMode,
       enterKeyRefs,
       completionSelectedRef,
       handleSubmit,

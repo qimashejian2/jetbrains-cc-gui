@@ -1,6 +1,6 @@
 import { act, renderHook } from '@testing-library/react';
 import { useSessionManagement } from './useSessionManagement.js';
-import type { HistoryData } from '../types/index.js';
+import type { ClaudeMessage, HistoryData } from '../types/index.js';
 
 describe('useSessionManagement', () => {
   const t = ((key: string) => key) as any;
@@ -847,5 +847,180 @@ describe('useSessionManagement', () => {
     });
     expect(window.__sessionTransitioning).toBe(false);
     expect(window.__sessionTransitionToken).toBeNull();
+  });
+
+  it('does not submit a fork while the Codex turn is busy', () => {
+    const mocks = createMocks();
+    renderHook(() => useSessionManagement({
+      messages: [], loading: true, historyData: null, currentSessionId: 'source-thread',
+      currentProvider: 'codex', ...mocks, t,
+    }));
+
+    act(() => window.dispatchEvent(new CustomEvent('codex-fork-message', {
+      detail: { threadId: 'source-thread', lastTurnId: 'completed-turn' },
+    })));
+
+    expect(window.sendToJava).not.toHaveBeenCalled();
+    expect(mocks.addToast).toHaveBeenCalledWith('chat.codexFork.busy', 'warning');
+  });
+
+  it('keeps the source session active when a fork request fails', async () => {
+    const mocks = createMocks();
+    renderHook(() => useSessionManagement({
+      messages: [], loading: false, historyData: null, currentSessionId: 'source-thread',
+      currentProvider: 'codex', ...mocks, t,
+    }));
+
+    await act(async () => {
+      window.dispatchEvent(new CustomEvent('codex-fork-message', {
+        detail: { threadId: 'source-thread', lastTurnId: 'completed-turn' },
+      }));
+      await Promise.resolve();
+    });
+    const payloadText = vi.mocked(window.sendToJava!).mock.calls[0][0] as string;
+    const payload = JSON.parse(payloadText.slice('codex_queue_action:'.length));
+    expect(payload).toMatchObject({
+      requestId: expect.any(String), action: 'fork', threadId: 'source-thread',
+      params: { threadId: 'source-thread', lastTurnId: 'completed-turn' },
+    });
+    expect(payload.turnId).toBeUndefined();
+
+    await act(async () => {
+      window.dispatchEvent(new CustomEvent('codex-queue-result', { detail: {
+        requestId: payload.requestId, success: false, error: 'native fork failure',
+      } }));
+      await Promise.resolve();
+    });
+
+    expect(mocks.setCurrentSessionId).not.toHaveBeenCalled();
+    expect(mocks.setMessages).not.toHaveBeenCalled();
+    expect(mocks.addToast).toHaveBeenCalledWith('chat.codexFork.failed', 'error');
+    expect(vi.mocked(window.sendToJava!).mock.calls.some(([message]) => String(message).startsWith('load_session:'))).toBe(false);
+  });
+
+  it('keeps a fork pending through the backend history and privacy processing window', () => {
+    vi.useFakeTimers();
+    try {
+      const mocks = createMocks();
+      renderHook(() => useSessionManagement({
+        messages: [], loading: false, historyData: null, currentSessionId: 'source-thread',
+        currentProvider: 'codex', ...mocks, t,
+      }));
+
+      act(() => window.dispatchEvent(new CustomEvent('codex-fork-message', {
+        detail: { threadId: 'source-thread', lastTurnId: 'completed-turn' },
+      })));
+      act(() => vi.advanceTimersByTime(129_999));
+      expect(mocks.addToast).not.toHaveBeenCalledWith('chat.codexFork.failed', 'error');
+
+      act(() => vi.advanceTimersByTime(1));
+      expect(mocks.addToast).toHaveBeenCalledWith('chat.codexFork.failed', 'error');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not switch when a nominally successful fork has no new thread id', async () => {
+    const mocks = createMocks();
+    renderHook(() => useSessionManagement({
+      messages: [], loading: false, historyData: null, currentSessionId: 'source-thread',
+      currentProvider: 'codex', ...mocks, t,
+    }));
+    await act(async () => {
+      window.dispatchEvent(new CustomEvent('codex-fork-message', {
+        detail: { threadId: 'source-thread', lastTurnId: 'completed-turn' },
+      }));
+      await Promise.resolve();
+    });
+    const payloadText = vi.mocked(window.sendToJava!).mock.calls[0][0] as string;
+    const payload = JSON.parse(payloadText.slice('codex_queue_action:'.length));
+
+    await act(async () => {
+      window.dispatchEvent(new CustomEvent('codex-queue-result', { detail: {
+        requestId: payload.requestId, success: true, result: { thread: {} },
+      } }));
+      await Promise.resolve();
+    });
+
+    expect(mocks.setCurrentSessionId).not.toHaveBeenCalled();
+    expect(window.sendToJava).not.toHaveBeenLastCalledWith(expect.stringMatching(/^load_session:/));
+    expect(mocks.addToast).toHaveBeenCalledWith('chat.codexFork.failed', 'error');
+  });
+
+  it('opens a returned fork only after a successful result includes its new thread id', async () => {
+    const mocks = createMocks();
+    renderHook(() => useSessionManagement({
+      messages: [], loading: false, historyData: null, currentSessionId: 'source-thread',
+      currentProvider: 'codex', ...mocks, t,
+    }));
+
+    await act(async () => {
+      window.dispatchEvent(new CustomEvent('codex-fork-message', {
+        detail: { threadId: 'source-thread', lastTurnId: 'completed-turn' },
+      }));
+      await Promise.resolve();
+    });
+    const payloadText = vi.mocked(window.sendToJava!).mock.calls[0][0] as string;
+    const payload = JSON.parse(payloadText.slice('codex_queue_action:'.length));
+
+    await act(async () => {
+      window.dispatchEvent(new CustomEvent('codex-queue-result', { detail: {
+        requestId: payload.requestId, success: true, result: { thread: { id: 'fork-thread' } },
+      } }));
+      await Promise.resolve();
+    });
+
+    expect(mocks.setCurrentSessionId).toHaveBeenCalledWith('fork-thread');
+    expect(window.sendToJava).toHaveBeenLastCalledWith('load_session:{"sessionId":"fork-thread","provider":"codex"}');
+    expect(mocks.addToast).not.toHaveBeenCalledWith('chat.codexFork.failed', 'error');
+  });
+
+  it('marks only the matching live Codex turn complete after its terminal runtime event', () => {
+    let currentMessages: ClaudeMessage[] = [
+      { type: 'assistant', raw: { codexThreadId: 'source-thread', codexTurnId: 'completed-turn' } },
+      { type: 'assistant', raw: { codexThreadId: 'other-thread', codexTurnId: 'completed-turn' } },
+      { type: 'assistant', raw: { codexThreadId: 'source-thread', codexTurnId: 'other-turn' } },
+    ];
+    const mocks = {
+      ...createMocks(),
+      setMessages: vi.fn((next: React.SetStateAction<ClaudeMessage[]>) => {
+        currentMessages = typeof next === 'function' ? next(currentMessages) : next;
+      }),
+    };
+    renderHook(() => useSessionManagement({
+      messages: currentMessages, loading: false, historyData: null, currentSessionId: 'source-thread',
+      currentProvider: 'codex', ...mocks, t,
+    }));
+
+    act(() => window.dispatchEvent(new CustomEvent('codex-runtime-event', { detail: {
+      kind: 'operationDone', threadId: 'source-thread', turnId: 'completed-turn',
+      payload: { outcome: 'completed' },
+    } })));
+
+    expect(currentMessages[0].raw).toMatchObject({ codexTurnStatus: 'completed' });
+    expect(currentMessages[1].raw).not.toHaveProperty('codexTurnStatus');
+    expect(currentMessages[2].raw).not.toHaveProperty('codexTurnStatus');
+  });
+
+  it.each([true, false])('keeps a newer source turn active when the fork result is late (loading=%s)', async (loading) => {
+    const mocks = createMocks();
+    const { rerender } = renderHook((props: { messages: ClaudeMessage[]; loading: boolean }) => useSessionManagement({
+      ...props, historyData: null, currentSessionId: 'source-thread', currentProvider: 'codex', ...mocks, t,
+    }), { initialProps: { messages: [] as ClaudeMessage[], loading: false } });
+    act(() => window.dispatchEvent(new CustomEvent('codex-fork-message', {
+      detail: { threadId: 'source-thread', lastTurnId: 'completed-turn' },
+    })));
+    const payloadText = vi.mocked(window.sendToJava!).mock.calls[0][0] as string;
+    const payload = JSON.parse(payloadText.slice('codex_queue_action:'.length));
+    rerender({ messages: [{ type: 'user', content: 'a newer request' }], loading });
+    await act(async () => {
+      window.dispatchEvent(new CustomEvent('codex-queue-result', { detail: {
+        requestId: payload.requestId, success: true, result: { thread: { id: 'fork-thread' } },
+      } }));
+      await Promise.resolve();
+    });
+    expect(mocks.setCurrentSessionId).not.toHaveBeenCalled();
+    expect(vi.mocked(window.sendToJava!).mock.calls).toHaveLength(1);
+    expect(mocks.addToast).toHaveBeenCalledWith('chat.codexFork.createdInHistory', 'info');
   });
 });

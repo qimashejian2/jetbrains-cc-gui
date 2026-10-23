@@ -1,14 +1,18 @@
-import { type RefObject, useCallback, useLayoutEffect, useMemo, useRef } from 'react';
+import { type RefObject, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ChatInputBox } from './ChatInputBox';
 import type {
   Attachment,
+  CodexFollowUpMode,
   ChatInputBoxHandle,
+  ChatInputBoxProps,
 } from './ChatInputBox/types';
 import { MessageAnchorRail } from './MessageAnchorRail';
 import { MessageList } from './MessageList';
 import { ScrollControl } from './ScrollControl';
 import { StatusPanel, StatusPanelErrorBoundary } from './StatusPanel';
+import { CodexSubagentsPanel } from './StatusPanel/CodexSubagentsPanel';
+import { CODEX_SUBAGENTS_PANEL_TOGGLE_EVENT } from './StatusPanel/codexSubagentsPanelEvent';
 import { WelcomeScreen } from './WelcomeScreen';
 import { ConversationSearch } from './ConversationSearch';
 import type { MessageListRevealHandle } from './ConversationSearch/types';
@@ -30,6 +34,7 @@ import { useCodexPetPreference } from './codexPet/useCodexPetPreference';
 import { reconcileMessageKeys, type MessageKeySnapshot } from '../utils/messageUtils';
 import { CodexPlanActions } from './CodexPlanActions';
 import type { CodexPlanItem } from '../hooks/useCodexPlanState';
+import type { CodexTurnActivity } from '../hooks/useCodexTurnActivity';
 
 type SubagentHistoryMap = ReturnType<typeof useMessages>['subagentHistories'];
 type ProviderState = ReturnType<typeof useModelProviderState>;
@@ -79,7 +84,7 @@ export interface ChatScreenProps {
   onKeepAll: FileChangeMgmt['handleKeepAll'];
 
   // Submit / interrupt / nav
-  onSubmit: (content: string, attachments?: Attachment[]) => void;
+  onSubmit: NonNullable<ChatInputBoxProps['onSubmit']>;
   onInterrupt: () => void;
   onRewind: () => void;
   onNavigateToProviderSettings: () => void;
@@ -125,12 +130,24 @@ export interface ChatScreenProps {
   onRemoveFromQueue: (id: string) => void;
   /** Drag-sort callback; orderedIds[0] is the next message to execute */
   onReorderQueue?: (orderedIds: string[]) => void;
+  onUpdateQueueItem?: (id: string, content: string) => Promise<boolean>;
+  onSteerQueueItem?: (id: string) => void;
+  onResumeQueue?: () => void;
+  queuePaused?: boolean;
+  queueTurnActive?: boolean;
+  steeringQueueIds?: ReadonlySet<string>;
+  retryableSteeringQueueIds?: ReadonlySet<string>;
+  queueError?: string | null;
+  codexFollowUpMode?: CodexFollowUpMode;
+  onCodexFollowUpModeChange?: (mode: CodexFollowUpMode) => void;
+  preserveInputUntilSubmitAccepted?: boolean;
 
   // Native Codex plan actions
   codexPlan?: CodexPlanItem | null;
   codexPlanExecutionPending?: boolean;
   codexCompactionPending?: boolean;
   codexCompactionStartedAt?: number | null;
+  codexTurnActivity?: CodexTurnActivity;
   onExecuteCodexPlan?: () => void;
   onContinueCodexPlan?: () => void;
 }
@@ -164,16 +181,32 @@ export const ChatScreen = ({
   onStreamingEnabledChange,
   onAutoOpenFileEnabledChange, onLongContextChange,
   messageQueue, onRemoveFromQueue, onReorderQueue,
+  onUpdateQueueItem, onSteerQueueItem, onResumeQueue,
+  queuePaused, queueTurnActive, steeringQueueIds, queueError,
+  retryableSteeringQueueIds, codexFollowUpMode, onCodexFollowUpModeChange,
+  preserveInputUntilSubmitAccepted,
   codexPlan = null, codexPlanExecutionPending = false,
   codexCompactionPending = false,
   codexCompactionStartedAt = null,
+  codexTurnActivity,
   onExecuteCodexPlan, onContinueCodexPlan,
 }: ChatScreenProps) => {
   const { t } = useTranslation();
+  const [codexSubagentsOpen, setCodexSubagentsOpen] = useState(false);
   const { messages, status, loading, isThinking, streamingActive, loadingStartTime, subagentHistories } = useMessages();
   // Native stream cleanup can precede the control reply without ending its wait.
-  const waiting = loading || codexCompactionPending;
+  const codexTurnActive = currentProvider === 'codex' && codexTurnActivity?.active === true;
+  const waiting = loading || codexCompactionPending || codexTurnActive;
+  const codexStatusKey = codexTurnActivity?.phase ?? 'running';
   const { currentSessionId } = useSession();
+  useEffect(() => {
+    const toggleSubagents = () => setCodexSubagentsOpen((open) => !open);
+    window.addEventListener(CODEX_SUBAGENTS_PANEL_TOGGLE_EVENT, toggleSubagents);
+    return () => window.removeEventListener(CODEX_SUBAGENTS_PANEL_TOGGLE_EVENT, toggleSubagents);
+  }, []);
+  useEffect(() => {
+    if (currentProvider !== 'codex') setCodexSubagentsOpen(false);
+  }, [currentProvider]);
   const previousMessageKeySnapshotRef = useRef<MessageKeySnapshot | undefined>(undefined);
   const messageKeySnapshot = useMemo(
     () => reconcileMessageKeys(
@@ -200,7 +233,7 @@ export const ChatScreen = ({
     () => messages.reduce((count, message) => count + (message.type === 'error' ? 1 : 0), 0),
     [messages],
   );
-  const handleSubmit = useCallback((content: string, attachments?: Attachment[]) => {
+  const handleSubmit = useCallback((content: string, attachments?: Attachment[], followUpMode?: CodexFollowUpMode) => {
     if (shouldToggleCodexPet(currentProvider, content, attachments?.length ?? 0)) {
       togglePet();
       setDraftInput('');
@@ -210,7 +243,9 @@ export const ChatScreen = ({
       );
       return;
     }
-    onSubmit(content, attachments);
+    return followUpMode === undefined
+      ? onSubmit(content, attachments)
+      : onSubmit(content, attachments, followUpMode);
   }, [addToast, currentProvider, onSubmit, petEnabled, setDraftInput, t, togglePet]);
 
   // Signal that the search hook can listen to for re-scanning. Combines
@@ -301,8 +336,11 @@ export const ChatScreen = ({
                   streamingActive={streamingActive}
                   isThinking={isThinking}
                   loading={waiting}
-                  loadingStartTime={codexCompactionPending ? codexCompactionStartedAt : loadingStartTime}
-                  waitingLabel={codexCompactionPending ? t('chat.compactSummary.nativeInProgress') : undefined}
+                  loadingStartTime={codexCompactionPending ? codexCompactionStartedAt
+                    : codexTurnActive ? codexTurnActivity?.startedAt ?? null : loadingStartTime}
+                  showWaitingElapsed={!codexTurnActive || Boolean(codexTurnActivity?.startedAt) || codexCompactionPending}
+                  waitingLabel={codexCompactionPending ? t('chat.compactSummary.nativeInProgress')
+                    : codexTurnActive ? t(`chat.codexTurnStatus.${codexStatusKey}`) : undefined}
                   t={t}
                   getMessageText={getMessageText}
                   getContentBlocks={getContentBlocks}
@@ -320,6 +358,17 @@ export const ChatScreen = ({
             </SubagentHistoryContext.Provider>
           </SessionIdContext.Provider>
         </div>
+        {currentProvider === 'codex' && codexSubagentsOpen && (
+          <StatusPanelErrorBoundary>
+            <CodexSubagentsPanel
+              subagents={subagents}
+              histories={subagentHistories}
+              currentSessionId={currentSessionId}
+              isStreaming={streamingActive}
+              onClose={() => setCodexSubagentsOpen(false)}
+            />
+          </StatusPanelErrorBoundary>
+        )}
         <CodexPetStatusBridge
           key={currentProvider}
           active={petEnabled && (currentProvider === 'codex' || currentProvider === 'claude')}
@@ -336,21 +385,23 @@ export const ChatScreen = ({
 
       <ScrollControl containerRef={messagesContainerRef} inputAreaRef={inputAreaRef} />
 
-      <StatusPanelErrorBoundary>
-        <StatusPanel
-          todos={globalTodos}
-          fileChanges={filteredFileChanges}
-          subagents={subagents}
-          subagentHistories={subagentHistories}
-          currentSessionId={currentSessionId}
-          currentProvider={currentProvider}
-          expanded={statusPanelExpanded}
-          isStreaming={streamingActive}
-          onUndoFile={onUndoFile}
-          onDiscardAll={onDiscardAll}
-          onKeepAll={onKeepAll}
-        />
-      </StatusPanelErrorBoundary>
+      {currentProvider !== 'codex' && (
+        <StatusPanelErrorBoundary>
+          <StatusPanel
+            todos={globalTodos}
+            fileChanges={filteredFileChanges}
+            subagents={subagents}
+            subagentHistories={subagentHistories}
+            currentSessionId={currentSessionId}
+            currentProvider={currentProvider}
+            expanded={statusPanelExpanded}
+            isStreaming={streamingActive}
+            onUndoFile={onUndoFile}
+            onDiscardAll={onDiscardAll}
+            onKeepAll={onKeepAll}
+          />
+        </StatusPanelErrorBoundary>
+      )}
 
       {currentProvider === 'codex' && onExecuteCodexPlan && onContinueCodexPlan && (
         <CodexPlanActions
@@ -361,7 +412,7 @@ export const ChatScreen = ({
         />
       )}
 
-      <div className="input-area" ref={inputAreaRef}>
+      <div className={`input-area${currentProvider === 'codex' ? ' codex-input-area' : ''}`} ref={inputAreaRef}>
         <ChatInputBox
           ref={chatInputRef}
           isLoading={waiting}
@@ -386,6 +437,7 @@ export const ChatScreen = ({
           value={draftInput}
           onInput={setDraftInput}
           onSubmit={handleSubmit}
+          preserveInputUntilSubmitAccepted={preserveInputUntilSubmitAccepted}
           onStop={onInterrupt}
           onModeSelect={onModeSelect}
           onModelSelect={onModelSelect}
@@ -436,6 +488,16 @@ export const ChatScreen = ({
           messageQueue={messageQueue}
           onRemoveFromQueue={onRemoveFromQueue}
           onReorderQueue={onReorderQueue}
+          onUpdateQueueItem={onUpdateQueueItem}
+          onSteerQueueItem={onSteerQueueItem}
+          onResumeQueue={onResumeQueue}
+          queuePaused={queuePaused}
+          queueTurnActive={queueTurnActive}
+          steeringQueueIds={steeringQueueIds}
+          retryableSteeringQueueIds={retryableSteeringQueueIds}
+          queueError={queueError}
+          codexFollowUpMode={codexFollowUpMode}
+          onCodexFollowUpModeChange={onCodexFollowUpModeChange}
           autoOpenFileEnabled={autoOpenFileEnabled}
           onAutoOpenFileEnabledChange={onAutoOpenFileEnabledChange}
           longContextEnabled={longContextEnabled}

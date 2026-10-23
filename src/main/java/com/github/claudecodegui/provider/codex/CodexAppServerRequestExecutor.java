@@ -77,14 +77,14 @@ class CodexAppServerRequestExecutor {
             JsonObject sendParams,
             Consumer<String> outputLineConsumer
     ) {
-        return CompletableFuture.supplyAsync(() -> {
-            SDKResult result = new SDKResult();
-            AtomicBoolean hadSendError = new AtomicBoolean(false);
-            AtomicReference<String> lastNodeError = new AtomicReference<>(null);
-            AtomicBoolean wasAborted = new AtomicBoolean(false);
-            try {
-                CodexAppServerRequestExecutor.this.log.info("[CodexDaemonExecutor] Sending via daemon: codex.send");
-                CompletableFuture<Boolean> cmdFuture = daemon.sendCommand(
+        SDKResult result = new SDKResult();
+        AtomicBoolean hadSendError = new AtomicBoolean(false);
+        AtomicReference<String> lastNodeError = new AtomicReference<>(null);
+        AtomicBoolean wasAborted = new AtomicBoolean(false);
+        CompletableFuture<Boolean> cmdFuture;
+        try {
+            CodexAppServerRequestExecutor.this.log.info("[CodexDaemonExecutor] Sending via daemon: codex.send");
+            cmdFuture = daemon.sendCommand(
                         "codex.send",
                         sendParams,
                         new DaemonBridge.DaemonOutputCallback() {
@@ -129,7 +129,17 @@ class CodexAppServerRequestExecutor {
                             }
                         }
                 );
-
+        } catch (Exception error) {
+            result.success = false;
+            result.error = "Daemon request failed: "
+                    + (error.getMessage() == null ? error.toString() : error.getMessage());
+            return CompletableFuture.completedFuture(result);
+        }
+        // The request is registered and written before this method returns.
+        // Waiting still happens on the dedicated executor so the caller can
+        // hold the runtime epoch lock only for dispatch ordering.
+        return CompletableFuture.supplyAsync(() -> {
+            try {
                 Boolean success = awaitWithLiveness(cmdFuture, daemon);
                 result.finalResult = "";
                 result.messageCount = result.messages.size();
@@ -239,6 +249,58 @@ class CodexAppServerRequestExecutor {
         }
     }
 
+    /** Registers and writes a control command immediately, then completes asynchronously. */
+    CompletableFuture<JsonObject> sendControlCommandAsync(
+            DaemonBridge daemon, String method, JsonObject params, long timeoutMs) {
+        CompletableFuture<Boolean> future;
+        try {
+            future = daemon.sendCommand(method, params, new DaemonBridge.DaemonOutputCallback() {
+                @Override
+                public void onLine(String line) {
+                    CodexAppServerRequestExecutor.this.log.debug(
+                            "[CodexDaemonExecutor] control line: " + line);
+                }
+
+                @Override
+                public void onStderr(String text) {
+                    CodexAppServerRequestExecutor.this.log.debug(
+                            "[CodexDaemonExecutor] control stderr: " + text);
+                }
+
+                @Override
+                public void onError(String error) {
+                    CodexAppServerRequestExecutor.this.log.warn(
+                            "[CodexDaemonExecutor] control error: " + error);
+                }
+
+                @Override
+                public void onComplete(boolean success) {
+                }
+            });
+        } catch (Exception error) {
+            JsonObject failed = new JsonObject();
+            failed.addProperty("error", error.getMessage() == null ? error.toString() : error.getMessage());
+            return CompletableFuture.completedFuture(failed);
+        }
+        return future.orTimeout(timeoutMs, TimeUnit.MILLISECONDS).handle((success, error) -> {
+            if (error != null) {
+                CodexAppServerRequestExecutor.this.log.warn(
+                        "[CodexDaemonExecutor] control command " + method + " failed: " + error.getMessage());
+                JsonObject failed = new JsonObject();
+                Throwable cause = error instanceof java.util.concurrent.CompletionException && error.getCause() != null
+                        ? error.getCause() : error;
+                failed.addProperty("error", cause.getMessage() == null ? cause.toString() : cause.getMessage());
+                return failed;
+            }
+            if (!Boolean.TRUE.equals(success)) {
+                JsonObject failed = new JsonObject();
+                failed.addProperty("error", method + " was rejected by the daemon");
+                return failed;
+            }
+            return new JsonObject();
+        });
+    }
+
     /**
      * Send an independent read-only command and retain its structured result.
      *
@@ -304,6 +366,88 @@ class CodexAppServerRequestExecutor {
             error.addProperty("error", e.getMessage() != null ? e.getMessage() : e.toString());
             return error;
         }
+    }
+
+    /**
+     * Send a stateful native Codex command through its independent daemon
+     * route and retain the complete daemon completion envelope.
+     *
+     * @param daemon live daemon bridge
+     * @param method controlled native command, for example {@code codex.queueAdd}
+     * @param params command parameters
+     * @param timeoutMs maximum wait in milliseconds
+     * @return daemon completion object, including its original {@code result},
+     *         {@code error}, and {@code code} fields
+     */
+    JsonObject sendNativeCommand(
+            DaemonBridge daemon,
+            String method,
+            JsonObject params,
+            long timeoutMs
+    ) {
+        AtomicReference<JsonObject> responseRef = new AtomicReference<>();
+        try {
+            CompletableFuture<Boolean> future = daemon.sendCommand(method, params,
+                    new DaemonBridge.DaemonOutputCallback() {
+                        @Override
+                        public void onLine(String line) {
+                            CodexAppServerRequestExecutor.this.log.debug("[CodexDaemonExecutor] native line: " + line);
+                        }
+
+                        @Override
+                        public void onStderr(String text) {
+                            CodexAppServerRequestExecutor.this.log.debug("[CodexDaemonExecutor] native stderr: " + text);
+                        }
+
+                        @Override
+                        public void onError(String error) {
+                            CodexAppServerRequestExecutor.this.log.warn("[CodexDaemonExecutor] native error: " + error);
+                        }
+
+                        @Override
+                        public void onResult(JsonObject response) {
+                            responseRef.set(response == null ? null : response.deepCopy());
+                        }
+
+                        @Override
+                        public void onComplete(boolean success) {
+                        }
+                    });
+            Boolean success = future.get(timeoutMs, TimeUnit.MILLISECONDS);
+            JsonObject response = responseRef.get();
+            if (response != null) {
+                return response;
+            }
+            return nativeCommandError(method + " completed without a daemon result"
+                    + (Boolean.TRUE.equals(success) ? "" : " (daemon reported failure)"), "DAEMON_ERROR");
+        } catch (TimeoutException timeout) {
+            CodexAppServerRequestExecutor.this.log.warn(
+                    "[CodexDaemonExecutor] native command " + method + " timed out after " + timeoutMs + "ms");
+            return nativeCommandError(method + " timed out after " + timeoutMs + "ms", "DAEMON_TIMEOUT");
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return nativeCommandError("Interrupted while waiting for " + method, "DAEMON_INTERRUPTED");
+        } catch (Exception error) {
+            JsonObject response = responseRef.get();
+            if (response != null) {
+                return response;
+            }
+            Throwable cause = error instanceof java.util.concurrent.ExecutionException && error.getCause() != null
+                    ? error.getCause() : error;
+            String message = cause.getMessage() == null ? cause.toString() : cause.getMessage();
+            CodexAppServerRequestExecutor.this.log.warn(
+                    "[CodexDaemonExecutor] native command " + method + " failed: " + message);
+            return nativeCommandError(message, "DAEMON_ERROR");
+        }
+    }
+
+    private static JsonObject nativeCommandError(String message, String code) {
+        JsonObject error = new JsonObject();
+        error.addProperty("success", false);
+        error.addProperty("error", message);
+        error.addProperty("code", code);
+        error.add("result", com.google.gson.JsonNull.INSTANCE);
+        return error;
     }
 
     /**

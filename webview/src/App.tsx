@@ -73,6 +73,10 @@ const App = () => {
     chatInputRef, messagesContainerRef, messagesEndRef, inputAreaRef, isAutoScrollingRef,
     handleUndoFile, onDiscardAll, handleKeepAll,
     handleSubmit, interruptSession, messageQueue, dequeueMessage, reorderMessageQueue,
+    onUpdateCodexQueueItem, onSteerCodexQueueItem, onResumeCodexQueue,
+    codexQueuePaused, codexQueueTurnActive, codexSteeringQueueIds, codexQueueError,
+    codexRetryableSteeringQueueIds, codexFollowUpMode, onCodexFollowUpModeChange,
+    preserveInputUntilSubmitAccepted,
     handleOpenRewindSelectDialog, handleNavigateToProviderSettings, wrappedHandleProviderSelect,
     createNewSession, loadHistorySession, deleteHistorySession, deleteHistorySessions,
     exportHistorySession, toggleFavoriteSession, updateHistoryTitle, convertToCliSession,
@@ -82,6 +86,7 @@ const App = () => {
     codexPlan, codexPlanExecutionPending, onExecuteCodexPlan, onContinueCodexPlan,
     codexCompactionPending,
     codexCompactionStartedAt,
+    codexTurnActivity,
   } = useAppChatController({ model, applyHistoryModel, setPermissionDialogTimeoutSeconds });
 
   const statusPanelExpanded = !userCollapsedRef.current;
@@ -91,6 +96,7 @@ const App = () => {
     <SubagentStateContext.Provider value={allSubagents}>
       <ToastContainer messages={toasts} onDismiss={dismissToast} />
       <AppHeader
+        currentProvider={model.currentProvider}
         sessionTitle={sessionTitle}
         onNewSession={createNewSession}
         onUpdateHistoryTitle={updateHistoryTitle}
@@ -180,10 +186,22 @@ const App = () => {
           messageQueue={messageQueue}
           onRemoveFromQueue={dequeueMessage}
           onReorderQueue={reorderMessageQueue}
+          onUpdateQueueItem={onUpdateCodexQueueItem}
+          onSteerQueueItem={onSteerCodexQueueItem}
+          onResumeQueue={onResumeCodexQueue}
+          queuePaused={codexQueuePaused}
+          queueTurnActive={codexQueueTurnActive}
+          steeringQueueIds={codexSteeringQueueIds}
+          retryableSteeringQueueIds={codexRetryableSteeringQueueIds}
+          queueError={codexQueueError}
+          codexFollowUpMode={codexFollowUpMode}
+          onCodexFollowUpModeChange={onCodexFollowUpModeChange}
+          preserveInputUntilSubmitAccepted={preserveInputUntilSubmitAccepted}
           codexPlan={codexPlan}
           codexPlanExecutionPending={codexPlanExecutionPending}
           codexCompactionPending={codexCompactionPending}
           codexCompactionStartedAt={codexCompactionStartedAt}
+          codexTurnActivity={codexTurnActivity}
           onExecuteCodexPlan={onExecuteCodexPlan}
           onContinueCodexPlan={onContinueCodexPlan}
           onLoadSession={loadHistorySession}

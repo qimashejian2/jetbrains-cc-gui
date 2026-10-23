@@ -6,14 +6,15 @@ interface WaitingIndicatorProps {
   size?: number;
   /** Loading start timestamp (ms), used to maintain continuous timing across view switches */
   startTime?: number;
+  showElapsed?: boolean;
 }
 
-export const WaitingIndicator = ({ size = 18, startTime, label }: WaitingIndicatorProps) => {
+export const WaitingIndicator = ({ size = 18, startTime, label, showElapsed = true }: WaitingIndicatorProps) => {
   const { t } = useTranslation();
   const [dotCount, setDotCount] = useState(1);
   const [elapsedSeconds, setElapsedSeconds] = useState(() => {
     // If a start time is provided, calculate the elapsed seconds
-    if (startTime) {
+    if (startTime !== undefined) {
       return Math.floor((Date.now() - startTime) / 1000);
     }
     return 0;
@@ -29,19 +30,24 @@ export const WaitingIndicator = ({ size = 18, startTime, label }: WaitingIndicat
 
   // Timer: track elapsed seconds for the current thinking round
   useEffect(() => {
-    const timer = setInterval(() => {
-      if (startTime) {
-        // Calculate from the externally provided start time to avoid reset on view switches
+    if (!showElapsed) return;
+    const updateElapsed = () => {
+      if (startTime !== undefined) {
         setElapsedSeconds(Math.floor((Date.now() - startTime) / 1000));
       } else {
         setElapsedSeconds(prev => prev + 1);
       }
+    };
+    if (startTime !== undefined) updateElapsed();
+    const timer = setInterval(() => {
+      // Calculate from the supplied start time to avoid reset on view switches.
+      updateElapsed();
     }, 1000);
 
     return () => {
       clearInterval(timer);
     };
-  }, [startTime]);
+  }, [showElapsed, startTime]);
 
   const dots = '.'.repeat(dotCount);
 
@@ -62,7 +68,7 @@ export const WaitingIndicator = ({ size = 18, startTime, label }: WaitingIndicat
       <span className="waiting-spinner" style={spinnerStyle} />
       <span className="waiting-text">
 	        {label ?? t('chat.generatingResponse')}<span className="waiting-dots">{dots}</span>
-	        <span className="waiting-seconds">（{t('chat.elapsedTime', { time: formatElapsedTime(elapsedSeconds) })}）</span>
+        {showElapsed && <span className="waiting-seconds">（{t('chat.elapsedTime', { time: formatElapsedTime(elapsedSeconds) })}）</span>}
       </span>
     </div>
   );

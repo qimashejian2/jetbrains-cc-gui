@@ -120,9 +120,9 @@ describe('native thinking lifecycle', () => {
     expect(markdownProps.isStreaming).toBe(false);
   });
 
-  it('renders a native plaintext text field without a thinking field', () => {
+  it('hides a native text field that is not an explicit public summary', () => {
     renderThinking({ type: 'thinking', text: 'A supplied native text summary', native: true, status: 'completed' });
-    expect(screen.getByTestId('md').textContent).toBe('A supplied native text summary');
+    expect(screen.queryByTestId('md')).toBeNull();
   });
 
   it('keeps the ordinary Claude empty-string and streaming behavior', () => {

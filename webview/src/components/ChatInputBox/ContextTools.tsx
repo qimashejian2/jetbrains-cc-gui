@@ -1,4 +1,5 @@
 import React, { useRef, useCallback, memo } from 'react';
+import { Plus } from 'lucide-react';
 import { TokenIndicator } from './TokenIndicator';
 
 const HIDDEN_INPUT_STYLE: React.CSSProperties = { display: 'none' };
@@ -8,6 +9,7 @@ interface ContextToolsProps {
   usedTokens?: number;
   maxTokens?: number;
   showUsage: boolean;
+  currentProvider?: string;
   onAddAttachment?: (files: FileList) => void;
 }
 
@@ -17,6 +19,7 @@ export const ContextTools: React.FC<ContextToolsProps> = memo(({
   usedTokens,
   maxTokens,
   showUsage,
+  currentProvider = 'claude',
   onAddAttachment,
 }) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -43,7 +46,9 @@ export const ContextTools: React.FC<ContextToolsProps> = memo(({
         title="Add attachment"
         aria-label="Add attachment"
       >
-        <span className="codicon codicon-attach" />
+        {currentProvider === 'codex'
+          ? <Plus aria-hidden="true" />
+          : <span className="codicon codicon-attach" />}
       </button>
 
       {/* Token Indicator */}

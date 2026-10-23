@@ -177,10 +177,10 @@ describe('extractSubagentsFromMessages', () => {
       } },
     ] } } }];
     const agents = extractSubagentsFromMessages(messages, getContentBlocks, findToolResult(messages), getToolResultRaw(messages));
-    expect(agents[0]).toMatchObject({ status: 'running', nativeTaskId: 'followup-one' });
+    expect(agents[0]).toMatchObject({ status: 'waiting', nativeTaskId: 'followup-one' });
     expect(applySubagentHistoryCompletion(agents, { 'restarted-spawn': {
       success: true, completed: true, status: 'completed', messages: [{ type: 'assistant', content: 'Old report' }],
-    } })[0].status).toBe('running');
+    } })[0].status).toBe('waiting');
     expect(applySubagentHistoryCompletion(agents, { 'restarted-spawn': {
       success: true, completed: true, status: 'completed', nativeTaskId: 'followup-one',
     } })[0].status).toBe('completed');
@@ -196,10 +196,16 @@ describe('extractSubagentsFromMessages', () => {
     const messages = [spawn];
     const extract = () => extractSubagentsFromMessages(messages, getContentBlocks, findToolResult(messages), getToolResultRaw(messages));
     expect(extract()[0]).toMatchObject({ agentId: 'child', status: 'running', isAsync: true });
+    expect(applySubagentHistoryCompletion(extract(), { spawn: {
+      success: true, completed: true, status: 'completed', messages: [{ type: 'assistant', content: 'stale report' }],
+    } })[0].status).toBe('running');
     messages.push(nativeRow('wait', 'collabAgentToolCall', { agentsStates: { child: { status: 'completed' } } }));
     expect(extract()[0].status).toBe('completed');
     messages.push(nativeRow('resume', 'collabAgentToolCall', { agentsStates: { child: { status: 'pendingInit' } } }));
-    expect(extract()[0].status).toBe('running');
+    expect(extract()[0].status).toBe('waiting');
+    expect(applySubagentHistoryCompletion(extract(), { spawn: {
+      success: true, completed: true, status: 'completed', messages: [{ type: 'assistant', content: 'stale report' }],
+    } })[0].status).toBe('waiting');
   });
   it('retains Codex spawn_agent path metadata for history requests', () => {
     const message: ClaudeMessage = {

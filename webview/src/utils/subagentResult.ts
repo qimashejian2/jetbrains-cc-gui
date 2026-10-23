@@ -41,7 +41,8 @@ export function extractAgentResultText(result?: ToolResultBlock | null, toolName
 export function resolveSubagentGroupOutcome(states: SubagentInfo[]): { isCompleted: boolean; isError: boolean } | undefined {
   if (states.length === 0) return undefined;
   return { isCompleted: states.every(agent => agent.status === 'completed'),
-    isError: states.every(agent => agent.status !== 'running') && states.some(agent => agent.status === 'error') };
+    isError: states.every(agent => agent.status === 'completed' || agent.status === 'error')
+      && states.some(agent => agent.status === 'error') };
 }
 
 /** A resumed child owns a new report; its previous completed transcript is not current. */

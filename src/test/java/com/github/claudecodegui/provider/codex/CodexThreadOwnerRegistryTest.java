@@ -38,4 +38,19 @@ public class CodexThreadOwnerRegistryTest {
             CodexThreadOwnerRegistry.releaseOwner(owner);
         }
     }
+
+    @Test
+    public void forkLeaseRemainsIndependentWhenSourceRelationIsReleased() {
+        String scope = "test-scope-" + System.nanoTime();
+        String owner = "owner-fork";
+        try {
+            assertTrue(CodexThreadOwnerRegistry.claim(scope, "source", owner).acquired());
+            assertTrue(CodexThreadOwnerRegistry.claim(scope, "fork", owner).acquired());
+            CodexThreadOwnerRegistry.releaseRelation(scope, "source", owner);
+            assertTrue(CodexThreadOwnerRegistry.ownerOf(scope, "source") == null);
+            assertTrue(owner.equals(CodexThreadOwnerRegistry.ownerOf(scope, "fork")));
+        } finally {
+            CodexThreadOwnerRegistry.releaseOwner(owner);
+        }
+    }
 }

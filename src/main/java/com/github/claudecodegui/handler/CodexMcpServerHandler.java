@@ -122,6 +122,18 @@ public class CodexMcpServerHandler extends BaseMessageHandler {
      * that can block for seconds per server (HTTP timeouts, `which` command execution).
      */
     private void handleGetMcpServerStatus() {
+        var session = this.context.getSession();
+        var bridge = this.context.getCodexSDKBridge();
+        String channelId = session == null ? null : session.getChannelId();
+        String cwd = this.context.resolveEffectiveWorkingDirectory();
+        String threadId = session == null ? null : session.getSessionId();
+        String expectedEpoch = bridge == null ? null : bridge.captureRuntimeSessionEpoch(channelId);
+        if (expectedEpoch == null) {
+            ApplicationManager.getApplication().invokeLater(() -> {
+                callJavaScript("window.updateCodexMcpServerStatus", escapeJs("[]"));
+            });
+            return;
+        }
         CompletableFuture.runAsync(() -> {
             try {
                 if (!isCodexConfigManagementAllowed()) {
@@ -131,12 +143,10 @@ public class CodexMcpServerHandler extends BaseMessageHandler {
                     return;
                 }
 
-                var session = this.context.getSession();
                 // The bridge already bounds each page at 35s; bound the whole
                 // paginated read so the status request can never hang forever.
-                JsonObject nativeStatus = this.context.getCodexSDKBridge().readCodexMcpStatus(
-                        session == null ? null : session.getChannelId(), this.context.resolveEffectiveWorkingDirectory(),
-                        session == null ? null : session.getSessionId()).get(120, java.util.concurrent.TimeUnit.SECONDS);
+                JsonObject nativeStatus = bridge.readCodexMcpStatus(channelId, cwd, threadId, expectedEpoch)
+                        .get(120, java.util.concurrent.TimeUnit.SECONDS);
                 List<JsonObject> statusList = projectNativeStatus(nativeStatus);
                 Gson gson = new Gson();
                 String statusJson = gson.toJson(statusList);
@@ -185,11 +195,23 @@ public class CodexMcpServerHandler extends BaseMessageHandler {
             String serverId = json.get("serverId").getAsString();
 
             var session = this.context.getSession();
+            var bridge = this.context.getCodexSDKBridge();
+            String channelId = session == null ? null : session.getChannelId();
+            String cwd = this.context.resolveEffectiveWorkingDirectory();
+            String threadId = session == null ? null : session.getSessionId();
             LOG.info("[CodexMcpServerHandler] Getting tools for Codex MCP server: " + serverId);
+            if (bridge == null) {
+                sendToolsError(serverId, "Codex bridge is unavailable", gson);
+                return;
+            }
+            String expectedEpoch = bridge.captureRuntimeSessionEpoch(channelId);
+            if (expectedEpoch == null) {
+                sendToolsError(serverId, "Codex session changed before MCP tools request (STALE_SESSION)", gson);
+                return;
+            }
 
-            CompletableFuture.supplyAsync(() -> this.context.getCodexSDKBridge().getMcpServerTools(serverId,
-                    session == null ? null : session.getChannelId(), this.context.resolveEffectiveWorkingDirectory(),
-                    session == null ? null : session.getSessionId())).thenCompose(request -> request)
+            CompletableFuture.supplyAsync(() -> bridge.getMcpServerTools(
+                    channelId, cwd, threadId, serverId, expectedEpoch)).thenCompose(request -> request)
                 .thenAccept(result -> {
                     String resultJson = gson.toJson(result);
                     ApplicationManager.getApplication().invokeLater(() ->

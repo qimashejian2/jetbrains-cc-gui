@@ -18,7 +18,7 @@ public class CodexHistoryPrivacyTest {
     @Test
     public void corruptOrRecoveredIndexNeverReleasesOpaqueAnswers() throws Exception {
         var directory = this.folder.newFolder("corrupt-recovered").toPath();
-        for (String content : new String[]{"{not-json", "{\"version\":2,\"entries\":[]}",
+        for (String content : new String[]{"{not-json", "{\"version\":3,\"entries\":[]}",
                 "{\"version\":1,\"conservativeMasking\":true,\"entries\":[{\"threadId\":\"thread\",\"callId\":\"ordinary\",\"questionIds\":[\"q\"],\"secretQuestionIds\":[]}]}",
                 "{\"version\":1,\"entries\":[null,{\"threadId\":\"thread\",\"callId\":\"ordinary\",\"questionIds\":[\"q\"],\"secretQuestionIds\":[]}]}"}) {
             Files.writeString(directory.resolve("index.json"), content);
@@ -34,6 +34,181 @@ public class CodexHistoryPrivacyTest {
     }
     @Rule
     public TemporaryFolder folder = new TemporaryFolder();
+
+    @Test
+    public void pendingForkGuardMasksUnknownForkBeforeClassificationIsDurable() throws Exception {
+        var directory = this.folder.newFolder("pending-fork").toPath();
+        var guard = directory.resolve("scope.record.fork-pending.transaction.json");
+        Files.writeString(guard, """
+                {"version":2,"entries":[],"conservativeExceptThreadIds":["ordinary-thread"]}
+                """);
+        JsonObject output = JsonParser.parseString("""
+                {"type":"functionCallOutput","callId":"copied-call","output":"copied secret"}
+                """).getAsJsonObject();
+        assertFalse(new CodexHistoryPrivacy(directory, "unknown-fork").protect(output).toString().contains("copied secret"));
+        assertTrue(new CodexHistoryPrivacy(directory, "ordinary-thread").protect(output).toString().contains("copied secret"));
+        Files.delete(guard);
+        assertTrue(new CodexHistoryPrivacy(directory, "ordinary-thread").protect(output).toString().contains("copied secret"));
+    }
+
+    @Test
+    public void v2ForkQuarantineAllowsBaselineAndExplicitlyTrustedNewThread() throws Exception {
+        var directory = this.folder.newFolder("v2-fork-quarantine").toPath();
+        Files.writeString(directory.resolve("fork-pending.json"), """
+                {"version":2,"entries":[],"conservativeExceptThreadIds":["source"]}
+                """);
+        Files.writeString(directory.resolve("source-classification.json"), """
+                {"version":1,"entries":[{"threadId":"source","callId":"source-call",
+                "questionIds":["q"],"secretQuestionIds":[]}]}
+                """);
+        Files.writeString(directory.resolve("fork-classification.json"), """
+                {"version":1,"entries":[{"threadId":"new-thread","callId":"fork-call",
+                "questionIds":["q"],"secretQuestionIds":[]}]}
+                """);
+        Files.writeString(directory.resolve("fork-trust.json"), """
+                {"version":2,"entries":[],"trustedThreadIds":["new-thread"]}
+                """);
+
+        JsonObject sourceAnswer = JsonParser.parseString("""
+                {"type":"functionCallOutput","callId":"source-call","output":{"answers":{"q":"source answer"}}}
+                """).getAsJsonObject();
+        JsonObject unknownForkOutput = JsonParser.parseString("""
+                {"type":"functionCallOutput","callId":"unknown-call","output":"unknown fork tool output"}
+                """).getAsJsonObject();
+        JsonObject trustedForkAnswer = JsonParser.parseString("""
+                {"type":"functionCallOutput","callId":"fork-call","output":{"answers":{"q":"trusted fork answer"}}}
+                """).getAsJsonObject();
+
+        assertTrue(new CodexHistoryPrivacy(directory, "source").protect(sourceAnswer).toString().contains("source answer"));
+        assertFalse(new CodexHistoryPrivacy(directory, "unknown-fork").protect(unknownForkOutput)
+                .toString().contains("unknown fork tool output"));
+        assertTrue(new CodexHistoryPrivacy(directory, "new-thread").protect(trustedForkAnswer)
+                .toString().contains("trusted fork answer"));
+    }
+
+    @Test
+    public void forkTrustCannotOverrideScopedOrGlobalMasking() throws Exception {
+        for (String blockingRecord : new String[]{
+                "{\"version\":1,\"entries\":[],\"conservativeThreadIds\":[\"fork\"]}",
+                "{\"version\":1,\"entries\":[],\"conservativeMasking\":true}", "{corrupt"}) {
+            var directory = this.folder.newFolder("fork-mask-and-trust-" + System.nanoTime()).toPath();
+            Files.writeString(directory.resolve("fork-mask.json"), blockingRecord);
+            Files.writeString(directory.resolve("fork-trust.json"), """
+                    {"version":2,"entries":[],"trustedThreadIds":["fork"]}
+                    """);
+            JsonObject output = JsonParser.parseString("""
+                    {"type":"functionCallOutput","callId":"call","output":"fork secret"}
+                    """).getAsJsonObject();
+
+            assertFalse(new CodexHistoryPrivacy(directory, "fork").protect(output).toString()
+                    .contains("fork secret"));
+        }
+    }
+
+    @Test
+    public void sessionWithoutIdentityMasksAnyForkIsolationPolicyEvenIfTrusted() throws Exception {
+        var directory = this.folder.newFolder("unknown-session-policy").toPath();
+        Files.writeString(directory.resolve("fork-pending.json"), """
+                {"version":2,"entries":[],"conservativeExceptThreadIds":["known"]}
+                """);
+        Files.writeString(directory.resolve("fork-trust.json"), """
+                {"version":2,"entries":[],"trustedThreadIds":["known"]}
+                """);
+        JsonObject output = JsonParser.parseString("""
+                {"type":"functionCallOutput","callId":"call","output":"unidentified secret"}
+                """).getAsJsonObject();
+
+        assertFalse(new CodexHistoryPrivacy(directory, null).protect(output).toString().contains("unidentified secret"));
+    }
+
+    @Test
+    public void malformedPrivacyIdArraysFallBackToGlobalMasking() throws Exception {
+        for (String content : new String[]{
+                "{\"version\":1,\"entries\":[],\"conservativeThreadIds\":[\"\",17]}",
+                "{\"version\":2,\"entries\":[],\"conservativeExceptThreadIds\":[\"source\",17]}",
+                "{\"version\":2,\"entries\":[],\"trustedThreadIds\":\"new-thread\"}"}) {
+            var directory = this.folder.newFolder("malformed-privacy-ids-" + System.nanoTime()).toPath();
+            Files.writeString(directory.resolve("invalid.json"), content);
+            Files.writeString(directory.resolve("classification.json"), """
+                    {"version":1,"entries":[{"threadId":"thread","callId":"call",
+                    "questionIds":["q"],"secretQuestionIds":[]}]}
+                    """);
+            JsonObject answer = JsonParser.parseString("""
+                    {"type":"functionCallOutput","callId":"call","output":{"answers":{"q":"must mask"}}}
+                    """).getAsJsonObject();
+
+            assertFalse(new CodexHistoryPrivacy(directory, "thread").protect(answer).toString().contains("must mask"));
+        }
+    }
+
+    @Test
+    public void forkTrustAggregationIsIndependentOfRecordEnumerationOrder() throws Exception {
+        for (boolean trustFirst : new boolean[]{false, true}) {
+            var directory = this.folder.newFolder("fork-record-order-" + trustFirst).toPath();
+            String quarantine = """
+                    {"version":2,"entries":[],"conservativeExceptThreadIds":["source"]}
+                    """;
+            String trust = """
+                    {"version":2,"entries":[],"trustedThreadIds":["new-thread"]}
+                    """;
+            if (trustFirst) {
+                Files.writeString(directory.resolve("first.json"), trust);
+                Files.writeString(directory.resolve("second.json"), quarantine);
+            } else {
+                Files.writeString(directory.resolve("first.json"), quarantine);
+                Files.writeString(directory.resolve("second.json"), trust);
+            }
+            Files.writeString(directory.resolve("classification.json"), """
+                    {"version":1,"entries":[{"threadId":"new-thread","callId":"call",
+                    "questionIds":["q"],"secretQuestionIds":[]}]}
+                    """);
+            JsonObject answer = JsonParser.parseString("""
+                    {"type":"functionCallOutput","callId":"call","output":{"answers":{"q":"trusted answer"}}}
+                    """).getAsJsonObject();
+
+            assertTrue(new CodexHistoryPrivacy(directory, "new-thread").protect(answer).toString()
+                    .contains("trusted answer"));
+        }
+    }
+
+    @Test
+    public void everyForkQuarantineMustExemptTheSession() throws Exception {
+        var directory = this.folder.newFolder("multiple-fork-quarantines").toPath();
+        Files.writeString(directory.resolve("quarantine-one.json"), """
+                {"version":2,"entries":[],"conservativeExceptThreadIds":["source","thread"]}
+                """);
+        Files.writeString(directory.resolve("quarantine-two.json"), """
+                {"version":2,"entries":[],"conservativeExceptThreadIds":["source"]}
+                """);
+        Files.writeString(directory.resolve("classification.json"), """
+                {"version":1,"entries":[{"threadId":"thread","callId":"call",
+                "questionIds":["q"],"secretQuestionIds":[]}]}
+                """);
+        JsonObject answer = JsonParser.parseString("""
+                {"type":"functionCallOutput","callId":"call","output":{"answers":{"q":"not exempt everywhere"}}}
+                """).getAsJsonObject();
+
+        assertFalse(new CodexHistoryPrivacy(directory, "thread").protect(answer).toString()
+                .contains("not exempt everywhere"));
+    }
+
+    @Test
+    public void forkOnlyConservativeMarkerDoesNotMaskSourceThread() throws Exception {
+        var directory = this.folder.newFolder("fork-thread-mask").toPath();
+        Files.writeString(directory.resolve("fork-mask.json"), """
+                {"version":1,"entries":[{"threadId":"source","callId":"ordinary",
+                "questionIds":["q"],"secretQuestionIds":[]}],"conservativeThreadIds":["fork"]}
+                """);
+        JsonObject answer = JsonParser.parseString("""
+                {"type":"functionCallOutput","callId":"ordinary","answers":{"q":"source answer"}}
+                """).getAsJsonObject();
+
+        String source = new CodexHistoryPrivacy(directory, "source").protect(answer).toString();
+        String fork = new CodexHistoryPrivacy(directory, "fork").protect(answer).toString();
+
+        assertTrue(source.contains("source answer"));
+        assertFalse(fork.contains("source answer"));
+    }
 
     /** Masks result data even when its field names resemble protocol identities. */
     @Test

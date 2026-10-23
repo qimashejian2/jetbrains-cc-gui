@@ -87,6 +87,7 @@ interface MessageListProps {
   loading: boolean;
   loadingStartTime: number | null;
   waitingLabel?: string;
+  showWaitingElapsed?: boolean;
   t: TFunction;
   getMessageText: (message: ClaudeMessage) => string;
   getContentBlocks: (message: ClaudeMessage) => ClaudeContentBlock[];
@@ -111,6 +112,7 @@ export const MessageList = memo(forwardRef<MessageListRevealHandle, MessageListP
   loading,
   loadingStartTime,
   waitingLabel,
+  showWaitingElapsed = true,
   t,
   getMessageText,
   getContentBlocks,
@@ -397,7 +399,8 @@ export const MessageList = memo(forwardRef<MessageListRevealHandle, MessageListP
       })}
 
       {/* Loading indicator */}
-      {loading && <WaitingIndicator startTime={loadingStartTime ?? undefined} label={waitingLabel} />}
+      {loading && <WaitingIndicator startTime={loadingStartTime ?? undefined} label={waitingLabel}
+        showElapsed={showWaitingElapsed} />}
       <div ref={messagesEndRef} />
     </div>
   );

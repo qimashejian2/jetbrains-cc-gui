@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Dispatch, SetStateAction } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
@@ -20,7 +20,7 @@ import {
 import { parseCodexCommand } from './hooks/codexCommandDispatcher';
 import { useCodexTurnActivity } from './hooks/useCodexTurnActivity';
 import { useCodexCompactionStatus } from './hooks/useCodexCompactionStatus';
-import type { Attachment, ChatInputBoxHandle, PermissionMode } from './components/ChatInputBox/types';
+import type { Attachment, ChatInputBoxHandle, CodexFollowUpMode, PermissionMode } from './components/ChatInputBox/types';
 import type { ChatScreenProps } from './components/ChatScreen';
 import { useSubagentContextValues, useSetTaskEvents } from './contexts/SubagentContext';
 import { useMessages } from './contexts/MessagesContext';
@@ -29,6 +29,8 @@ import { useUIState } from './contexts/UIStateContext';
 import { useDialogs } from './contexts/DialogContext';
 import type { ApplyHistoryModel } from './applyHistoryModel';
 import { useCodexPlanState } from './hooks/useCodexPlanState';
+import { useCodexActiveTurnId } from './hooks/useCodexActiveTurnId';
+import { useCodexThreadQueue } from './hooks/useCodexThreadQueue';
 
 /**
  * Subset of useModelProviderState's return consumed by this controller.
@@ -84,6 +86,17 @@ interface UseAppChatControllerOptions {
   setPermissionDialogTimeoutSeconds: Dispatch<SetStateAction<number>>;
 }
 
+const CODEX_FOLLOW_UP_MODE_KEY = 'ccgui.codexFollowUpMode';
+
+function readCodexFollowUpMode(): CodexFollowUpMode {
+  try {
+    const stored = window.localStorage.getItem(CODEX_FOLLOW_UP_MODE_KEY);
+    return stored === 'steer' || stored === 'interrupt' ? 'steer' : 'queue';
+  } catch {
+    return 'queue';
+  }
+}
+
 /**
  * Chat orchestration extracted verbatim from App.tsx: scroll/streaming state,
  * session management, bridge window callbacks, message processing/sending,
@@ -97,6 +110,15 @@ export const useAppChatController = ({
   setPermissionDialogTimeoutSeconds,
 }: UseAppChatControllerOptions) => {
   const { t } = useTranslation();
+  const [codexFollowUpMode, setCodexFollowUpMode] = useState<CodexFollowUpMode>(readCodexFollowUpMode);
+  const handleCodexFollowUpModeChange = useCallback((mode: CodexFollowUpMode) => {
+    setCodexFollowUpMode(mode);
+    try {
+      window.localStorage.setItem(CODEX_FOLLOW_UP_MODE_KEY, mode);
+    } catch {
+      // Continue with the in-memory preference when webview storage is unavailable.
+    }
+  }, []);
 
   // ── Dialog management (DialogContext) ──
   const {
@@ -165,7 +187,14 @@ export const useAppChatController = ({
     setUsagePercentage, setUsageUsedTokens, setUsageMaxTokens,
   } = model;
 
-  const codexTurnActive = useCodexTurnActivity(currentProvider, currentSessionId);
+  const codexTurnActivity = useCodexTurnActivity(currentProvider, currentSessionId);
+  const codexTurnActive = codexTurnActivity.active;
+  const codexTurnId = useCodexActiveTurnId(currentProvider, currentSessionId);
+  const codexQueue = useCodexThreadQueue({
+    threadId: currentProvider === 'codex' ? currentSessionId : null,
+    turnId: codexTurnId,
+    active: codexTurnActive,
+  });
   const { pending: codexCompactionPending, startedAt: codexCompactionStartedAt,
     startCompaction: startCodexCompaction } = useCodexCompactionStatus({
     provider: currentProvider, threadId: currentSessionId, t, setMessages, setLoading, setLoadingStartTime,
@@ -287,7 +316,7 @@ export const useAppChatController = ({
 
   const {
     handleSubmit: hookHandleSubmit,
-    interruptSession,
+    interruptSession: interruptCurrentSession,
   } = useMessageSender({
     t, addToast,
     currentProvider, selectedModel, permissionMode, reasoningEffort, selectedAgent, codexFastMode,
@@ -307,6 +336,10 @@ export const useAppChatController = ({
     codexCompactionPending,
   });
 
+  const hasPendingCodexQueue = currentProvider === 'codex' && codexQueue.queue.length > 0;
+  const submissionBusy = loading || codexTurnActive || codexPlanExecutionPending || codexCompactionPending
+    || hasPendingCodexQueue;
+
   // ── Message queue ──
   const {
     queue: messageQueue,
@@ -314,7 +347,12 @@ export const useAppChatController = ({
     dequeue: dequeueMessage,
     clearQueue,
     reorder: reorderMessageQueue,
-  } = useMessageQueue({ isLoading: loading || codexTurnActive || codexPlanExecutionPending || codexCompactionPending, onExecute: hookHandleSubmit });
+  } = useMessageQueue({ isLoading: submissionBusy, onExecute: hookHandleSubmit });
+
+  const interruptSession = useCallback(() => {
+    if (currentProvider === 'codex' && codexQueue.queue.length > 0) codexQueue.pause();
+    interruptCurrentSession();
+  }, [codexQueue.pause, codexQueue.queue.length, currentProvider, interruptCurrentSession]);
 
   // Point the session-transition indirection at the real clearQueue.
   useEffect(() => {
@@ -322,7 +360,7 @@ export const useAppChatController = ({
   }, [clearQueue]);
 
   // handleSubmit with queue support (new session and local commands bypass loading check)
-  const handleSubmit = useCallback((content: string, attachments?: Attachment[]) => {
+  const handleSubmit = useCallback((content: string, attachments?: Attachment[], followUpOverride?: CodexFollowUpMode) => {
     const text = content.replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
     const hasAttachments = Array.isArray(attachments) && attachments.length > 0;
     if (!text && !hasAttachments) return;
@@ -339,7 +377,7 @@ export const useAppChatController = ({
         setCurrentView('history');
         return;
       }
-      // /plan - switch to plan mode (Claude only; Codex sends as normal text).
+      // Claude /plan switches collaboration mode locally.
       // Claude keeps the legacy behavior for `/plan <args>`: switch the mode
       // instead of leaking the literal command text to the model.
       if (parsedCommand?.kind === 'plan' && currentProvider === 'claude') {
@@ -347,24 +385,95 @@ export const useAppChatController = ({
         addToast(t('chat.planModeEnabled', { defaultValue: 'Plan mode enabled' }), 'info');
         return;
       }
+      // A bare Codex /plan only changes the desired collaboration mode. It
+      // does not start a turn, so it remains safe while native work is active.
+      if (parsedCommand?.kind === 'plan' && currentProvider === 'codex' && !parsedCommand.hasArguments) {
+        hookHandleSubmit(content, attachments);
+        return true;
+      }
       // /context - handled locally even while loading
       if (text.split(/\s+/)[0].toLowerCase() === '/context' || CONTEXT_COMMANDS.has(text.split(/\s+/)[0].toLowerCase())) {
         hookHandleSubmit(content, attachments);
-        return;
+        return true;
       }
       // Workspace/settings reads remain available while native work is waiting.
       if (currentProvider === 'codex' && ['diff', 'approvals'].includes(parsedCommand?.kind ?? '')) {
         hookHandleSubmit(content, attachments);
-        return;
+        return true;
+      }
+      if (currentProvider === 'codex' && submissionBusy && parsedCommand
+        && ((parsedCommand.kind === 'plan' && parsedCommand.hasArguments)
+          || ['init', 'compact', 'review'].includes(parsedCommand.kind))) {
+        addToast(t('chat.codexCommandBusy', {
+          defaultValue: 'Wait for the current Codex operation to finish before running this command.',
+        }), 'warning');
+        return false;
       }
     }
     // If loading, add to queue
-    if (loading || codexTurnActive || codexPlanExecutionPending || codexCompactionPending) {
+    if (submissionBusy) {
+      if (currentProvider === 'codex' && codexTurnActive) {
+        const mode = followUpOverride ?? codexFollowUpMode;
+        return mode === 'steer'
+          ? codexQueue.steerInput(content, attachments)
+          : codexQueue.enqueue(content, attachments);
+      }
       enqueueMessage(content, attachments);
       return;
     }
     hookHandleSubmit(content, attachments);
-  }, [loading, codexTurnActive, codexPlanExecutionPending, codexCompactionPending, enqueueMessage, hookHandleSubmit, forceCreateNewSession, currentProvider, handleModeSelect, setCurrentView, addToast, t]);
+  }, [submissionBusy, codexTurnActive, enqueueMessage, hookHandleSubmit, forceCreateNewSession, currentProvider, handleModeSelect, setCurrentView, addToast, t, codexFollowUpMode, codexQueue.enqueue, codexQueue.steerInput]);
+
+  const visibleQueue = currentProvider === 'codex'
+    ? [
+        ...codexQueue.queue.map((item) => ({
+          ...item,
+          id: `native:${item.id}`,
+          source: 'native' as const,
+          sourceId: item.id,
+        })),
+        ...messageQueue.map((item) => ({
+          ...item,
+          id: `local:${item.id}`,
+          source: 'local' as const,
+          sourceId: item.id,
+        })),
+      ]
+    : messageQueue;
+  const removeQueueItem = useCallback((id: string) => {
+    if (currentProvider === 'codex' && id.startsWith('native:')) {
+      void codexQueue.remove(id.slice('native:'.length));
+      return;
+    }
+    dequeueMessage(currentProvider === 'codex' && id.startsWith('local:')
+      ? id.slice('local:'.length)
+      : id);
+  }, [codexQueue.queue, codexQueue.remove, currentProvider, dequeueMessage]);
+  const reorderQueue = useCallback((orderedIds: string[]) => {
+    if (currentProvider === 'codex') {
+      const orderedNative = orderedIds.flatMap((id) => id.startsWith('native:') ? [id.slice('native:'.length)] : []);
+      const orderedLocal = orderedIds.flatMap((id) => id.startsWith('local:') ? [id.slice('local:'.length)] : []);
+      const nativeIds = codexQueue.queue.map((item) => item.id);
+      const localIds = messageQueue.map((item) => item.id);
+      const nativeSet = new Set(nativeIds);
+      const localSet = new Set(localIds);
+      const completeNativeOrder = [
+        ...orderedNative.filter((id) => nativeSet.has(id)),
+        ...nativeIds.filter((id) => !orderedNative.includes(id)),
+      ];
+      const completeLocalOrder = [
+        ...orderedLocal.filter((id) => localSet.has(id)),
+        ...localIds.filter((id) => !orderedLocal.includes(id)),
+      ];
+      if (completeNativeOrder.length > 0) codexQueue.reorder(completeNativeOrder);
+      if (completeLocalOrder.length > 0) reorderMessageQueue(completeLocalOrder);
+      return;
+    }
+    reorderMessageQueue(orderedIds);
+  }, [codexQueue.queue, codexQueue.reorder, currentProvider, messageQueue, reorderMessageQueue]);
+  const updateCodexQueueItem = useCallback((id: string, content: string) => codexQueue.update(id, content), [codexQueue.update]);
+  const steerCodexQueueItem = useCallback((id: string) => { void codexQueue.steer(id); }, [codexQueue.steer]);
+  const resumeCodexQueue = useCallback(() => { void codexQueue.resume(); }, [codexQueue.resume]);
 
   // ── Chat-view computations (stage 5 of TASK-P1-01) ──
   const {
@@ -423,7 +532,19 @@ export const useAppChatController = ({
     chatInputRef, messagesContainerRef, messagesEndRef, inputAreaRef, isAutoScrollingRef,
     // Message actions
     handleUndoFile, onDiscardAll, handleKeepAll,
-    handleSubmit, interruptSession, messageQueue, dequeueMessage, reorderMessageQueue,
+    handleSubmit, interruptSession, messageQueue: visibleQueue, dequeueMessage: removeQueueItem, reorderMessageQueue: reorderQueue,
+    onUpdateCodexQueueItem: updateCodexQueueItem,
+    onSteerCodexQueueItem: steerCodexQueueItem,
+    onResumeCodexQueue: resumeCodexQueue,
+    codexQueuePaused: codexQueue.paused,
+    codexQueueTurnActive: codexTurnActive && Boolean(codexTurnId),
+    codexSteeringQueueIds: codexQueue.steeringIds,
+    codexRetryableSteeringQueueIds: codexQueue.retryableSteeringIds,
+    codexQueueError: codexQueue.error,
+    codexFollowUpMode,
+    onCodexFollowUpModeChange: handleCodexFollowUpModeChange,
+    preserveInputUntilSubmitAccepted: currentProvider === 'codex' && submissionBusy,
+    codexTurnActivity,
     handleOpenRewindSelectDialog, handleNavigateToProviderSettings, wrappedHandleProviderSelect,
     codexPlan, codexPlanExecutionPending,
     codexCompactionPending,

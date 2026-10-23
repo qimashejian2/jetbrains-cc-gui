@@ -1,5 +1,5 @@
 import type { MutableRefObject } from 'react';
-import type { SendShortcut } from '../types.js';
+import type { CodexFollowUpMode, SendShortcut } from '../types.js';
 
 /**
  * How long after compositionend a plain Enter may still be the IME's own
@@ -37,6 +37,21 @@ export type EnterKeyDownVerdict = 'swallowed' | 'awaitingIme' | 'open';
 
 export function isEnterKey(key: string, keyCode: number | undefined): boolean {
   return key === 'Enter' || keyCode === 13;
+}
+
+export function isFollowUpOverrideKey(e: {
+  key: string;
+  keyCode?: number;
+  shiftKey: boolean;
+  metaKey: boolean;
+  ctrlKey: boolean;
+  altKey: boolean;
+}): boolean {
+  return isEnterKey(e.key, e.keyCode) && e.shiftKey && (e.metaKey || e.ctrlKey) && !e.altKey;
+}
+
+export function oppositeFollowUpMode(mode: CodexFollowUpMode): CodexFollowUpMode {
+  return mode === 'queue' ? 'steer' : 'queue';
 }
 
 export function isSendKey(sendShortcut: SendShortcut, e: EnterKeyModifiers): boolean {

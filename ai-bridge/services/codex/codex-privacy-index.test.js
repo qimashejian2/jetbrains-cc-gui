@@ -1,11 +1,122 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { CodexPrivacyIndex } from './codex-privacy-index.js';
+
+test('a pre-fork guard survives a restart and later classification write failures', async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), 'codex-privacy-pending-'));
+  const index = new CodexPrivacyIndex({ rootDir });
+  const protectionRecord = await index.beginForkProtection();
+  await chmod(rootDir, 0o555);
+  try {
+    const turns = [{ id: 'turn', items: [{ id: 'item', callId: 'call' }] }];
+    await assert.rejects(index.markThreadConservative('fork'), error => error.code === 'EACCES');
+    // Force inheritance to need a durable fork marker, too.
+    await assert.rejects(index.inheritFork({ sourceThreadId: 'source', forkThreadId: 'fork',
+      lastTurnId: 'missing', sourceTurns: turns, forkTurns: turns, protectionRecord }),
+    error => error.code === 'EACCES');
+    const reloaded = new CodexPrivacyIndex({ rootDir });
+    await reloaded.load();
+    assert.equal(reloaded.isConservativeThread('fork'), true);
+    assert.doesNotMatch(JSON.stringify(reloaded.redact({ type: 'functionCallOutput',
+      output: 'secret copied by fork' }, { threadId: 'fork' })), /secret copied by fork/);
+  } finally {
+    await chmod(rootDir, 0o755);
+    await index.completeForkProtection(protectionRecord);
+  }
+});
+
+test('completing a fork removes only its temporary guard and retains inherited classifications', async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), 'codex-privacy-guard-complete-'));
+  const index = new CodexPrivacyIndex({ rootDir });
+  await index.record({ threadId: 'source', turnId: 'turn', callId: 'call', itemId: 'item',
+    method: 'item/tool/requestUserInput', params: { questions: [{ id: 'q', isSecret: true }] } });
+  const protectionRecord = await index.beginForkProtection();
+  // An ordinary concurrent record must not copy the temporary global mask.
+  await index.record({ threadId: 'ordinary', turnId: 'turn', callId: 'normal',
+    method: 'item/tool/requestUserInput', params: { questions: [{ id: 'q', isSecret: false }] } });
+  const turns = [{ id: 'turn', items: [{ id: 'item', callId: 'call' }] }];
+  assert.deepEqual(await index.inheritFork({ sourceThreadId: 'source', forkThreadId: 'fork',
+    lastTurnId: 'turn', sourceTurns: turns, forkTurns: turns, protectionRecord }),
+  { inherited: 1, conservativeMasking: false });
+  assert.equal(index.isConservativeThread('unrelated'), true);
+  await index.completeForkProtection(protectionRecord);
+  const reloaded = new CodexPrivacyIndex({ rootDir });
+  await reloaded.load();
+  assert.equal(reloaded.isConservativeThread('source'), false);
+  assert.equal(reloaded.isConservativeThread('fork'), false);
+  assert.equal(reloaded.isSecretIdentity({ threadId: 'fork', turnId: 'turn', itemId: 'item', callId: 'call' }), true);
+  assert.match(JSON.stringify(reloaded.redact({ type: 'functionCallOutput', callId: 'normal',
+    output: { answers: { q: 'ordinary answer' } } }, { threadId: 'ordinary', turnId: 'turn' })), /ordinary answer/);
+});
+
+test('concurrent fork quarantines do not block each other or expose unknown threads', async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), 'codex-privacy-two-guards-'));
+  const index = new CodexPrivacyIndex({ rootDir });
+  const first = await index.beginForkProtection({ knownThreadIds: ['source', 'ordinary'], sourceThreadId: 'source' });
+  const otherDaemon = new CodexPrivacyIndex({ rootDir });
+  const second = await otherDaemon.beginForkProtection({ knownThreadIds: ['source', 'ordinary'], sourceThreadId: 'source' });
+  assert.notEqual(first, second);
+  assert.equal(index.isConservativeThread('unknown'), true);
+  assert.equal(index.isConservativeThread('source'), false);
+  await assert.rejects(index.completeForkProtection('../' + first), /Invalid fork protection record/);
+  const turns = [{ id: 'turn', items: [] }];
+  assert.deepEqual(await index.inheritFork({ sourceThreadId: 'source', forkThreadId: 'fork',
+    lastTurnId: 'turn', sourceTurns: turns, forkTurns: turns, protectionRecord: first }),
+  { inherited: 0, conservativeMasking: false });
+  await index.completeForkProtection(first);
+  assert.equal(index.isConservativeThread('unknown'), true, 'the other in-flight fork still protects unknown threads');
+  assert.equal(index.isConservativeThread('fork'), true, 'the second baseline also predates this fork');
+  await otherDaemon.completeForkProtection(second);
+  await index.load();
+  assert.equal(index.isConservativeThread('unknown'), false);
+  assert.equal(index.isConservativeThread('fork'), false);
+});
+
+test('an uncertain fork stays quarantined while later forks and trusted thread starts proceed', async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), 'codex-privacy-quarantine-'));
+  const index = new CodexPrivacyIndex({ rootDir });
+  const first = await index.beginForkProtection({ knownThreadIds: ['source'], sourceThreadId: 'source' });
+  await index.recordForkResult(first, 'unknown-fork');
+  await index.quarantineForkProtection(first);
+  assert.equal(index.isConservativeThread('source'), false);
+  assert.equal(index.isConservativeThread('unknown-fork'), true);
+
+  const next = await index.beginForkProtection({ knownThreadIds: ['source', 'unknown-fork'], sourceThreadId: 'source' });
+  await index.recordCreatedThread('new-thread');
+  assert.equal(index.isConservativeThread('unknown-fork'), true, 'an earlier quarantine remains authoritative');
+  assert.equal(index.isConservativeThread('new-thread'), false);
+  await index.markThreadConservative('new-thread');
+  assert.equal(index.isConservativeThread('new-thread'), true, 'explicit masks override thread-start trust');
+  await index.completeForkProtection(next);
+
+  const reloaded = new CodexPrivacyIndex({ rootDir });
+  await reloaded.load();
+  assert.equal(reloaded.isConservativeThread('unknown-fork'), true);
+  assert.equal(reloaded.isConservativeThread('new-thread'), true);
+});
+
+test('legacy global fork guards migrate without blocking and keep unidentified history protected', async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), 'codex-privacy-legacy-guard-'));
+  const index = new CodexPrivacyIndex({ rootDir });
+  const legacyName = `${index.recordPrefix}fork-pending.legacy.json`;
+  await writeFile(join(rootDir, legacyName), JSON.stringify({ version: 1, entries: [], conservativeMasking: true }));
+
+  await index.migrateLegacyForkProtection();
+  assert.equal(index.isConservativeThread('old-thread'), true);
+  await index.recordCreatedThread('new-thread');
+  assert.equal(index.isConservativeThread('new-thread'), false);
+  const next = await index.beginForkProtection({ knownThreadIds: ['new-thread'], sourceThreadId: 'new-thread' });
+  await index.completeForkProtection(next);
+  const reloaded = new CodexPrivacyIndex({ rootDir });
+  await reloaded.load();
+  assert.equal(reloaded.isConservativeThread('old-thread'), true);
+  assert.equal(reloaded.isConservativeThread('new-thread'), false);
+});
 
 test('redacted native schemas preserve special property names as JSON data', async () => {
   const index = new CodexPrivacyIndex({ rootDir: await mkdtemp(join(tmpdir(), 'codex-privacy-schema-')) });
@@ -118,7 +229,8 @@ test('corrupt classification protects results without erasing native history tex
 });
 
 test('recording after index corruption cannot erase uncertainty or release old opaque outputs', async () => {
-  for (const content of ['{not-json', '{"version":2,"entries":[]}', '{"version":1,"entries":[null]}']) {
+  for (const content of ['{not-json', '{"version":2,"entries":[],"conservativeExceptThreadIds":"broken"}',
+    '{"version":1,"entries":[null]}', '{"version":1,"entries":[],"trustedThreadIds":["untrusted"]}']) {
     const rootDir = await mkdtemp(join(tmpdir(), 'codex-privacy-repair-'));
     const first = new CodexPrivacyIndex({ rootDir, scope: 'repair' });
     await writeFile(first.filePath, content, 'utf8');
@@ -320,4 +432,107 @@ test('invalid answer containers cannot bypass masking through raw output', async
   for (const answers of ['synthetic-secret', ['synthetic-secret'], 42]) {
     assert.doesNotMatch(JSON.stringify(index.redact({ output: JSON.stringify({ answers }) })), /synthetic-secret|42/);
   }
+});
+
+test('fork inherits only identity-mapped classifications through the inclusive last turn', async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), 'codex-privacy-fork-boundary-'));
+  const index = new CodexPrivacyIndex({ rootDir, scope: 'fork-boundary' });
+  await index.record({ threadId: 'source', turnId: 'turn-before', itemId: 'item-before',
+    callId: 'call-before', method: 'item/tool/requestUserInput',
+    params: { questions: [{ id: 'secret-before', isSecret: true }] } });
+  await index.record({ threadId: 'source', turnId: 'turn-after', itemId: 'item-after',
+    callId: 'call-after', method: 'item/tool/requestUserInput',
+    params: { questions: [{ id: 'secret-after', isSecret: true }] } });
+  const sourceTurns = [
+    { id: 'turn-before', items: [{ id: 'item-before', callId: 'call-before' }] },
+    { id: 'turn-after', items: [{ id: 'item-after', callId: 'call-after' }] },
+  ];
+  const result = await index.inheritFork({ sourceThreadId: 'source', forkThreadId: 'fork',
+    lastTurnId: 'turn-before', sourceTurns, forkTurns: sourceTurns.slice(0, 1) });
+
+  assert.deepEqual(result, { inherited: 1, conservativeMasking: false });
+  const reloaded = new CodexPrivacyIndex({ rootDir, scope: 'fork-boundary' });
+  await reloaded.load();
+  assert.deepEqual(reloaded.entries.filter((entry) => entry.threadId === 'fork').map((entry) => entry.turnId), ['turn-before']);
+  assert.equal(reloaded.isConservativeThread('source'), false);
+  assert.equal(reloaded.isConservativeThread('fork'), false);
+});
+
+test('fork privacy inheritance fails closed when a boundary or mapping is unavailable', async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), 'codex-privacy-fork-invalid-'));
+  const index = new CodexPrivacyIndex({ rootDir, scope: 'fork-invalid' });
+  await assert.rejects(index.inheritFork({ sourceThreadId: 'source', forkThreadId: 'fork',
+    sourceTurns: [], forkTurns: [] }), /lastTurnId/);
+  await assert.rejects(index.inheritFork({ sourceThreadId: 'same', forkThreadId: 'same', lastTurnId: 'turn',
+    sourceTurns: [{ id: 'turn', items: [] }], forkTurns: [{ id: 'turn', items: [] }] }), /distinct thread id/);
+  const result = await index.inheritFork({ sourceThreadId: 'source', forkThreadId: 'fork', lastTurnId: 'missing',
+    sourceTurns: [{ id: 'turn', items: [] }], forkTurns: [{ id: 'turn', items: [] }] });
+  assert.deepEqual(result, { inherited: 0, conservativeMasking: true });
+  assert.equal(index.isConservativeThread('source'), false);
+  assert.equal(index.isConservativeThread('fork'), true);
+});
+
+test('unmappable fork classifications mask only the fork thread after reload', async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), 'codex-privacy-fork-conservative-'));
+  const index = new CodexPrivacyIndex({ rootDir, scope: 'fork-conservative' });
+  await index.record({ threadId: 'source', turnId: 'turn-1', callId: 'call-1', itemId: 'item-1',
+    method: 'item/tool/requestUserInput',
+    params: { questions: [{ id: 'question', isSecret: true }] } });
+  await index.record({ threadId: 'source', turnId: 'turn-1', callId: 'ordinary', itemId: 'ordinary-item',
+    method: 'item/tool/requestUserInput',
+    params: { questions: [{ id: 'ordinary', isSecret: false }] } });
+  const result = await index.inheritFork({ sourceThreadId: 'source', forkThreadId: 'fork',
+    lastTurnId: 'turn-1', sourceTurns: [{ id: 'turn-1', items: [{ id: 'item-1', callId: 'call-1' }] }],
+    forkTurns: [{ id: 'turn-1', items: [{ id: 'different-item', callId: 'different-call' }] }] });
+
+  assert.deepEqual(result, { inherited: 0, conservativeMasking: true });
+  const reloaded = new CodexPrivacyIndex({ rootDir, scope: 'fork-conservative' });
+  await reloaded.load();
+  assert.equal(reloaded.isConservativeThread('source'), false);
+  assert.equal(reloaded.isConservativeThread('fork'), true);
+  const sourceOutput = reloaded.redact({ type: 'functionCallOutput', callId: 'ordinary',
+    output: { answers: { ordinary: 'source answer' } } }, { threadId: 'source', turnId: 'turn-1', callId: 'ordinary' });
+  const forkOutput = reloaded.redact({ type: 'functionCallOutput', callId: 'ordinary',
+    output: { answers: { ordinary: 'fork answer' } } }, { threadId: 'fork', turnId: 'turn-1', callId: 'ordinary' });
+  assert.match(JSON.stringify(sourceOutput), /source answer/);
+  assert.doesNotMatch(JSON.stringify(forkOutput), /fork answer/);
+});
+
+test('fork masks only the fork when a source classification turn is absent from history', async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), 'codex-privacy-fork-missing-turn-'));
+  const index = new CodexPrivacyIndex({ rootDir, scope: 'fork-missing-turn' });
+  await index.record({ threadId: 'source', turnId: 'unavailable-turn', callId: 'call-1', itemId: 'item-1',
+    method: 'item/tool/requestUserInput', params: { questions: [{ id: 'secret', isSecret: true }] } });
+
+  const turns = [{ id: 'boundary-turn', items: [] }];
+  const result = await index.inheritFork({ sourceThreadId: 'source', forkThreadId: 'fork',
+    lastTurnId: 'boundary-turn', sourceTurns: turns, forkTurns: turns });
+
+  assert.deepEqual(result, { inherited: 0, conservativeMasking: true });
+  assert.equal(index.isConservativeThread('source'), false);
+  assert.equal(index.isConservativeThread('fork'), true);
+});
+
+test('fork classifications and its conservative marker persist in one atomic record', async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), 'codex-privacy-fork-atomic-'));
+  const index = new CodexPrivacyIndex({ rootDir, scope: 'fork-atomic' });
+  for (const [itemId, callId] of [['mapped-item', 'mapped-call'], ['unmapped-item', 'unmapped-call']]) {
+    await index.record({ threadId: 'source', turnId: 'turn-1', itemId, callId,
+      method: 'item/tool/requestUserInput', params: { questions: [{ id: itemId, isSecret: true }] } });
+  }
+  const sourceTurns = [{ id: 'turn-1', items: [
+    { id: 'mapped-item', callId: 'mapped-call' }, { id: 'unmapped-item', callId: 'unmapped-call' },
+  ] }];
+  const forkTurns = [{ id: 'turn-1', items: [{ id: 'mapped-item', callId: 'mapped-call' },
+    { id: 'different-item', callId: 'different-call' }] }];
+
+  const result = await index.inheritFork({ sourceThreadId: 'source', forkThreadId: 'fork',
+    lastTurnId: 'turn-1', sourceTurns, forkTurns });
+
+  assert.deepEqual(result, { inherited: 1, conservativeMasking: true });
+  const records = await Promise.all((await readdir(rootDir)).filter(name => name.endsWith('.json'))
+    .map(async name => JSON.parse(await readFile(join(rootDir, name), 'utf8'))));
+  const forkRecord = records.find(record => record.conservativeThreadIds?.includes('fork'));
+  assert.ok(forkRecord);
+  assert.deepEqual(forkRecord.entries.map(entry => entry.threadId), ['fork']);
 });

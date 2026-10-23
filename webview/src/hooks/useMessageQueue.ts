@@ -6,6 +6,10 @@ export interface QueuedMessage {
   content: string;
   attachments?: Attachment[];
   queuedAt: number;
+  /** Display identity for a queue combined from local and native sources. */
+  source?: 'local' | 'native';
+  /** Original id used by the queue source's actions and status sets. */
+  sourceId?: string;
 }
 
 export interface UseMessageQueueOptions {

@@ -820,6 +820,8 @@ public class ClaudeSession {
         final String finalRequestedDshPreset = requestedDshPreset;
 
         return launchClaude().thenCompose(chId -> {
+            String codexRuntimeEpoch = "codex".equals(state.getProvider())
+                    ? sendService.captureCodexRuntimeSessionEpoch(chId) : null;
             sendService.prepareContextCollector(contextCollector);
 
             return contextCollector.collectContext().thenCompose(openedFilesJson ->
@@ -835,7 +837,8 @@ public class ClaudeSession {
                             finalRequestedCodexFastMode,
                             finalRequestedDshPreset,
                             clientMessageId,
-                            nativeCodexSettings
+                            nativeCodexSettings,
+                            codexRuntimeEpoch
                     )
             ).thenCompose(v -> syncUserMessageUuidsAfterSend());
         }).exceptionally(ex -> {

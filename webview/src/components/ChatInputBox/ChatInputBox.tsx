@@ -81,6 +81,17 @@ export const ChatInputBox = memo(forwardRef<ChatInputBoxHandle, ChatInputBoxProp
       messageQueue,
       onRemoveFromQueue,
       onReorderQueue,
+      onUpdateQueueItem,
+      onSteerQueueItem,
+      onResumeQueue,
+      queuePaused,
+      queueTurnActive,
+      steeringQueueIds,
+      retryableSteeringQueueIds,
+      queueError,
+      codexFollowUpMode = 'queue',
+      onCodexFollowUpModeChange,
+      preserveInputUntilSubmitAccepted,
       autoOpenFileEnabled,
       onAutoOpenFileEnabledChange,
       longContextEnabled = true,
@@ -137,10 +148,12 @@ export const ChatInputBox = memo(forwardRef<ChatInputBoxHandle, ChatInputBoxProp
     } = useChatInputController({
       selectedModel,
       currentProvider,
+      codexFollowUpMode,
       attachments: externalAttachments,
       value,
       onSubmit,
       onInput,
+      preserveInputUntilSubmitAccepted,
       onAddAttachment,
       onRemoveAttachment,
       onModeSelect,
@@ -161,7 +174,8 @@ export const ChatInputBox = memo(forwardRef<ChatInputBoxHandle, ChatInputBoxProp
 
     return (
       <div
-        className={`chat-input-box ${isResizingInputBox ? 'is-resizing' : ''}`}
+        className={`chat-input-box${currentProvider === 'codex' ? ' chat-input-box--codex' : ''} ${isResizingInputBox ? 'is-resizing' : ''}`}
+        data-provider={currentProvider}
         onClick={focusInput}
         role="button"
         tabIndex={0}
@@ -209,6 +223,16 @@ export const ChatInputBox = memo(forwardRef<ChatInputBoxHandle, ChatInputBoxProp
           messageQueue={messageQueue}
           onRemoveFromQueue={onRemoveFromQueue}
           onReorderQueue={onReorderQueue}
+          onUpdateQueueItem={onUpdateQueueItem}
+          onSteerQueueItem={onSteerQueueItem}
+          onResumeQueue={onResumeQueue}
+          queuePaused={queuePaused}
+          queueTurnActive={queueTurnActive}
+          steeringQueueIds={steeringQueueIds}
+          retryableSteeringQueueIds={retryableSteeringQueueIds}
+          queueError={queueError}
+          codexFollowUpMode={codexFollowUpMode}
+          onCodexFollowUpModeChange={onCodexFollowUpModeChange}
           showOpenSourceBanner={showOpenSourceBanner}
           onDismissOpenSourceBanner={handleDismissOpenSourceBanner}
           autoOpenFileEnabled={autoOpenFileEnabled}

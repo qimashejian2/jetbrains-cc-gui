@@ -212,6 +212,50 @@
     top: -14px;
 }
 
+/* Codex turn actions follow the message in one compact row, as in VS Code. */
+.codex-message .turn-action-controls {
+    align-self: flex-end;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    min-height: 20px;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+}
+
+.codex-message:hover .turn-action-controls,
+.codex-message:focus-within .turn-action-controls {
+    opacity: 1;
+}
+
+.codex-message .turn-action-controls .message-copy-btn {
+    position: relative;
+    top: auto;
+    right: auto;
+    width: 20px;
+    height: 20px;
+    padding: 2px;
+    color: var(--text-secondary);
+    background: transparent;
+    border: 0;
+    border-radius: 4px;
+    opacity: 0.7;
+    visibility: visible;
+    z-index: auto;
+}
+
+.codex-message .turn-action-controls .message-copy-btn:hover,
+.codex-message .turn-action-controls .message-copy-btn:focus-visible {
+    color: var(--text-primary);
+    background: var(--bg-hover);
+    opacity: 1;
+}
+
+.codex-message .turn-action-controls .message-copy-btn:focus-visible {
+    outline: 2px solid var(--input-focus-border);
+    outline-offset: 1px;
+}
+
 /* Inline copy button for user messages (in header row) */
 .message-copy-btn-inline {
     position: relative;
@@ -296,6 +340,10 @@
     .message-copy-btn-inline {
         opacity: 0.7;
         visibility: visible;
+    }
+
+    .codex-message .turn-action-controls {
+        opacity: 1;
     }
 }
 

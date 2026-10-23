@@ -64,6 +64,44 @@ export const STOP_CONFIRMATION_BUDGET_MS = 10_000;
 export const COMPACT_ANNOUNCEMENT_BUDGET_MS = 60_000;
 
 const TERMINAL_TURN_STATUSES = new Set(['completed', 'failed', 'interrupted']);
+const NATIVE_REQUEST_METHODS = new Set([
+  'thread/queue/add', 'thread/queue/list', 'thread/queue/update',
+  'thread/queue/delete', 'thread/queue/reorder', 'thread/queue/start',
+  'turn/steer', 'thread/fork',
+]);
+
+function validateNativeRequestParams(method, params) {
+  const requiredString = (key) => typeof params[key] === 'string' && params[key].trim().length > 0;
+  const invalid = (message) => { throw new ClassifiedError('INVALID_PARAMS', message, { method }); };
+  if (!requiredString('threadId')) invalid(`${method} requires threadId`);
+  if (method === 'thread/queue/add') {
+    if (!Array.isArray(params.input) || params.input.length === 0) invalid(`${method} requires non-empty input`);
+    if (!requiredString('clientUserMessageId')) invalid(`${method} requires clientUserMessageId`);
+  } else if (method === 'thread/queue/update') {
+    if (!requiredString('queuedSubmissionId')) invalid(`${method} requires queuedSubmissionId`);
+    if (!Array.isArray(params.input) || params.input.length === 0) invalid(`${method} requires non-empty input`);
+  } else if (method === 'thread/queue/delete') {
+    if (!requiredString('queuedSubmissionId')) invalid(`${method} requires queuedSubmissionId`);
+  } else if (method === 'thread/queue/reorder') {
+    if (!Array.isArray(params.queuedSubmissionIds)) invalid(`${method} requires queuedSubmissionIds`);
+  } else if (method === 'thread/queue/start') {
+    if (params.queuedSubmissionId != null && !requiredString('queuedSubmissionId')) {
+      invalid(`${method} queuedSubmissionId must be a non-empty string when provided`);
+    }
+  } else if (method === 'turn/steer') {
+    if (!requiredString('expectedTurnId')) invalid(`${method} requires expectedTurnId`);
+    if (!Array.isArray(params.input) || params.input.length === 0) invalid(`${method} requires non-empty input`);
+  } else if (method === 'thread/fork') {
+    if (!requiredString('lastTurnId')) invalid(`${method} requires lastTurnId`);
+    if (params.beforeTurnId != null) invalid(`${method} only accepts the lastTurnId boundary`);
+  }
+}
+
+function withoutPrivateReasoningText(item) {
+  if (!item || typeof item !== 'object' || Array.isArray(item)
+      || (item.type ?? item.itemType) !== 'reasoning') return item;
+  return Object.fromEntries(Object.entries(item).filter(([key]) => key !== 'content' && key !== 'text'));
+}
 
 export class CodexAppServerService extends EventEmitter {
   /**
@@ -120,6 +158,7 @@ export class CodexAppServerService extends EventEmitter {
     this.runtimeGeneration = 0;
     this.client = null;
     this.runtimeResetPromise = null;
+    this.retired = false;
     this.rootThreadId = null;
     this.desiredThreadId = null;
 
@@ -182,6 +221,7 @@ export class CodexAppServerService extends EventEmitter {
 
   /** Lazily start the runtime and perform the handshake. Idempotent. */
   async ensureRuntime() {
+    if (this.retired) throw new ClassifiedError('STALE_SESSION', 'Codex session was released');
     if (this.state === 'ready' && this.client?.alive) {
       return;
     }
@@ -217,7 +257,7 @@ export class CodexAppServerService extends EventEmitter {
         try {
           if (this.privacyIndex?.load) await this.privacyIndex.load();
           const candidate = await this.clientFactory();
-          if (this.runtimeGeneration !== generation || this.state !== 'starting') {
+          if (this.retired || this.runtimeGeneration !== generation || this.state !== 'starting') {
             candidate.close();
             throw new ClassifiedError('RUNTIME_RESET', 'Codex runtime was released during client preparation');
           }
@@ -504,6 +544,9 @@ export class CodexAppServerService extends EventEmitter {
     if (!threadId) {
       throw new ClassifiedError('PROTOCOL', 'thread/start response did not include a thread id');
     }
+    // A direct creation response proves this is not an unidentified old fork.
+    // Do not infer this trust from resume, history, or thread notifications.
+    if (this.privacyIndex?.recordCreatedThread) await this.privacyIndex.recordCreatedThread(threadId);
     this.#recordThreadRelation(threadId);
     const thread = this.threads.get(threadId);
     thread.state = 'idle';
@@ -733,6 +776,7 @@ export class CodexAppServerService extends EventEmitter {
       if (operation.settled) {
         return;
       }
+      operation.runtimeGeneration = this.runtimeGeneration;
       // Stop may have requested cancellation while the runtime was starting.
       if (operation.cancelRequested && operation.dispatchPhase === 'notWritten') {
         this.#settleOperation(operation, { outcome: 'cancelled', error: 'cancelled before dispatch' });
@@ -1177,6 +1221,30 @@ export class CodexAppServerService extends EventEmitter {
       case 'turn/diff/updated':
         this.#handleThreadScopedEvent(method, params);
         break;
+      // VS Code parity: additional thread-scoped notifications surfaced to the
+      // Java layer as codex_event envelopes (kind = native method name).
+      case 'thread/goal/updated':
+      case 'thread/goal/cleared':
+      case 'thread/queue/changed':
+      case 'thread/status/changed':
+      case 'thread/attachment/updated':
+      case 'thread/environment/connected':
+      case 'thread/environment/disconnected':
+      case 'thread/archived':
+      case 'thread/unarchived':
+      case 'thread/deleted':
+      case 'thread/reverted':
+      case 'thread/prediction/updated':
+      case 'thread/project/updated':
+      case 'turn/moderationMetadata':
+        this.#handleThreadScopedEvent(method, params);
+        break;
+      // VS Code parity: auto-approval review lifecycle mirrors other item
+      // notifications — thread-scoped passthrough keeps itemId/turnId intact.
+      case 'item/autoApprovalReview/started':
+      case 'item/autoApprovalReview/completed':
+        this.#handleThreadScopedEvent(method, params);
+        break;
       case 'thread/compacted':
         this.#handleThreadCompacted(params);
         break;
@@ -1352,6 +1420,7 @@ export class CodexAppServerService extends EventEmitter {
     const itemId = params?.item?.id ?? null;
     const itemType = params?.item?.type ?? params?.item?.itemType ?? null;
     let safeItem = this.privacyIndex?.redact(params?.item, { threadId, turnId, itemId }) ?? params?.item;
+    safeItem = withoutPrivateReasoningText(safeItem);
     if (['contextCompaction', 'reasoning'].includes(itemType) && safeItem && !safeItem.status) {
       safeItem = { ...safeItem, status: method === 'item/completed' ? 'completed' : 'inProgress' };
     }
@@ -1519,7 +1588,7 @@ export class CodexAppServerService extends EventEmitter {
       }));
     }
     if (operation && typeof delta === 'string' && delta.length > 0
-        && ['item/agentMessage/delta', 'item/reasoning/summaryTextDelta', 'item/reasoning/textDelta'].includes(method)) {
+        && ['item/agentMessage/delta', 'item/reasoning/summaryTextDelta'].includes(method)) {
       if (params?.itemId) {
         const key = this.#itemSnapshotKey(threadId, params.itemId);
         const previous = this.itemSnapshots.get(key) ?? { id: params.itemId };
@@ -1544,7 +1613,8 @@ export class CodexAppServerService extends EventEmitter {
       threadId,
       turnId,
       clientOperationId: operation?.clientOperationId ?? null,
-      payload: this.privacyIndex?.redact(params ?? {}, { threadId, turnId }) ?? params ?? {},
+      payload: method === 'item/reasoning/textDelta' ? { itemId: params?.itemId ?? null }
+        : this.privacyIndex?.redact(params ?? {}, { threadId, turnId }) ?? params ?? {},
     }));
   }
 
@@ -1892,14 +1962,13 @@ export class CodexAppServerService extends EventEmitter {
       turnId: turnId ?? item.turnId ?? previous.turnId ?? null,
     };
     if (snapshot.type === 'reasoning') {
-      // Native summary deltas can carry plaintext that is absent from the completed item.
-      for (const field of ['summary', 'content']) {
-        if (Array.isArray(item[field]) && item[field].length === 0 && Array.isArray(previous[field])
-            && previous[field].some(entry => typeof entry === 'string' ? entry.length > 0
-              : typeof entry?.text === 'string' && entry.text.length > 0)) {
-          snapshot[field] = previous[field];
-        }
+      if (Array.isArray(item.summary) && item.summary.length === 0 && Array.isArray(previous.summary)
+          && previous.summary.some(entry => typeof entry === 'string' ? entry.length > 0
+            : typeof entry?.text === 'string' && entry.text.length > 0)) {
+        snapshot.summary = previous.summary;
       }
+      delete snapshot.content;
+      delete snapshot.text;
     }
     if (['agentMessage', 'agent_message'].includes(item.type ?? item.itemType ?? previous.type ?? previous.itemType)) {
       // Native versions use either text or content. A stale empty representation
@@ -2032,6 +2101,7 @@ export class CodexAppServerService extends EventEmitter {
       this.launchOptions = launchOptions;
     }
     await this.ensureRuntime();
+    if (this.retired) throw new ClassifiedError('STALE_SESSION', 'Codex session was released');
     if (threadId) {
       this.desiredThreadId = threadId;
       this.#recordThreadRelation(threadId);
@@ -2062,6 +2132,83 @@ export class CodexAppServerService extends EventEmitter {
     const response = await this.client.request(method, params, { timeoutMs: 30_000 });
     if (this.privacyIndex?.load) await this.privacyIndex.load();
     return method.startsWith('thread/') ? this.#redactNativeProjection(response, params) : response;
+  }
+
+  /**
+   * Execute a tightly allowlisted stateful RPC without joining the send FIFO.
+   * The active runtime and a verified owned thread are required; these calls
+   * must never cold-start a writer or silently fall back to local queue state.
+   */
+  async nativeRequest(method, params = {}, { timeoutMs = 30_000, expectedRuntimeGeneration } = {}) {
+    if (!NATIVE_REQUEST_METHODS.has(method)) {
+      throw new ClassifiedError('UNSUPPORTED', `unsupported Codex native method: ${method}`, { method });
+    }
+    if (!params || typeof params !== 'object' || Array.isArray(params)) {
+      throw new ClassifiedError('INVALID_PARAMS', `${method} requires an object params value`, { method });
+    }
+    validateNativeRequestParams(method, params);
+
+    const client = this.client;
+    const runtimeGeneration = this.runtimeGeneration;
+    if (expectedRuntimeGeneration !== undefined && expectedRuntimeGeneration !== runtimeGeneration) {
+      throw new ClassifiedError('RUNTIME_RESET', 'Codex runtime changed before the native request', { method });
+    }
+    if (this.state !== 'ready' || !client?.alive) {
+      throw new ClassifiedError('NO_RUNTIME', 'Codex native runtime is not ready', { method });
+    }
+
+    const threadId = params.threadId;
+    const thread = this.threads.get(threadId);
+    if (!this.rootThreadId || !thread || !thread.relationVerified || !this.#isThreadLoaded(threadId)
+        || this.#rootOf(threadId) !== this.rootThreadId) {
+      throw new ClassifiedError('STALE_THREAD', `Codex thread is not owned by this session: ${threadId}`, { method, threadId });
+    }
+
+    if (method === 'turn/steer') {
+      const active = this.operations.get(this.activeOperationId ?? '');
+      if (!active || active.settled || !active.nativeTurnId) {
+        throw new ClassifiedError('NO_ACTIVE_TURN', 'There is no active native turn to steer', { method, threadId });
+      }
+      if (active.threadId !== threadId) {
+        throw new ClassifiedError('THREAD_MISMATCH', 'The active native turn belongs to another thread', {
+          method, threadId, activeThreadId: active.threadId,
+        });
+      }
+      if (active.runtimeGeneration !== runtimeGeneration) {
+        throw new ClassifiedError('RUNTIME_RESET', 'The active turn belongs to a previous Codex runtime', { method, threadId });
+      }
+      if (active.nativeTurnId !== params.expectedTurnId) {
+        throw new ClassifiedError('NO_ACTIVE_TURN', 'The expected turn is no longer active', {
+          method, threadId, expectedTurnId: params.expectedTurnId,
+        });
+      }
+    }
+
+    let response;
+    try {
+      // CodexAppServerClient advertises experimentalApi during initialize.
+      // The server remains authoritative for method support and rejects an
+      // unavailable experimental RPC with JSON-RPC method-not-found.
+      response = await client.request(method, structuredClone(params), { timeoutMs });
+    } catch (error) {
+      if (this.client !== client || this.runtimeGeneration !== runtimeGeneration || !client.alive) {
+        throw new ClassifiedError('RUNTIME_RESET', 'Codex runtime changed during the native request', {
+          method, causeCode: error?.code ?? null,
+        });
+      }
+      if (error?.code === 'RPC_ERROR' && error.rpcCode === -32601) {
+        throw new ClassifiedError('UNSUPPORTED', `Codex App Server does not support ${method}`, {
+          method, rpcCode: error.rpcCode,
+        });
+      }
+      throw error;
+    }
+
+    if (this.client !== client || this.runtimeGeneration !== runtimeGeneration
+        || this.state !== 'ready' || !client.alive) {
+      throw new ClassifiedError('RUNTIME_RESET', 'Codex runtime changed during the native request', { method, threadId });
+    }
+    return response;
   }
 
   /** Save a name on the owned native root without opening or resuming another writer. */
@@ -2137,6 +2284,7 @@ export class CodexAppServerService extends EventEmitter {
    * cancelled, descendants unloaded, and the lease freed after confirmation.
    */
   async releaseThread(threadId = null) {
+    this.retired = true;
     const target = threadId ?? this.rootThreadId;
     this.#setState('draining');
     try {

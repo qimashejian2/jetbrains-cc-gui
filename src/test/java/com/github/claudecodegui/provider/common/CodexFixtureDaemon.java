@@ -46,7 +46,9 @@ public final class CodexFixtureDaemon extends DaemonBridge {
     @Override
     public CompletableFuture<Boolean> sendCommand(String method, JsonObject params, DaemonOutputCallback callback) {
         JsonObject isolated = params.deepCopy();
-        isolated.add("codexCommandPrefix", this.peerCommand.deepCopy());
+        if (method.startsWith("codex.") && !isolated.has("codexCommandPrefix")) {
+            isolated.add("codexCommandPrefix", this.peerCommand.deepCopy());
+        }
         return super.sendCommand(method, isolated, callback);
     }
 }
